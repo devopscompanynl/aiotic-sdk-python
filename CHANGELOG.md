@@ -6,6 +6,12 @@ Dates are release dates. The full documentation is at <https://developers.aiotic
 
 ## Unreleased
 
+## 0.1.2 — 2026-10-04
+
+### Fixed
+
+- The README's changelog and license links also work when viewed on PyPI.
+
 ## 0.1.1 — 2026-10-04
 
 First release on PyPI: `pip install "aiotic-sdk[all]"`. Verified against AIOTIC API 1.0.0.

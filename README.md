@@ -5,7 +5,7 @@ software.
 
 - **Documentation:** <https://developers.aiotic.ai> — the AIOTIC Integrator Guide, with the SDK chapters, the API
   reference and the contracts for the ERP receive endpoint and the processing webhook.
-- **Changes:** [CHANGELOG.md](CHANGELOG.md).
+- **Changes:** [CHANGELOG.md](https://github.com/devopscompanynl/aiotic-sdk-python/blob/main/CHANGELOG.md).
 - **Questions and problems:** open an issue in this repository.
 
 ## Install
@@ -74,4 +74,4 @@ Pull requests cannot be merged here directly; please open an issue and we will t
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](https://github.com/devopscompanynl/aiotic-sdk-python/blob/main/LICENSE).

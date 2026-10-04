@@ -1,3 +1,3 @@
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 # The AIOTIC API version this SDK is verified against (see spec/openapi.yaml `info.version`).
 API_VERSION = "1.0.0"
