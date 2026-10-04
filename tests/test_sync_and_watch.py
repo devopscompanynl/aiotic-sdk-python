@@ -20,9 +20,13 @@ def test_sync_engine_skips_unchanged(client: AioticClient) -> None:
     rep = eng.apply_many([ChangeEvent.customer_upsert("SYNC-C", name="Sync BV"), ChangeEvent.mapping_upsert("SYNC-C", "THEIR-1", item_number="SYNC-1", language_code="nl")])
     assert rep.sent == 2 and rep.failed == 0
     assert client.customer_products.get("SYNC-C", "THEIR-1").item_number == "SYNC-1"
-    # reconcile: product disappeared from the ERP → deleted in AIOTIC; customer unchanged → skipped
+    # reconcile with an EMPTY product set: refused (a broken export must not delete), customer and mapping unchanged → skipped
     rep2 = eng.reconcile(customers=[ChangeEvent.customer_upsert("SYNC-C", name="Sync BV")], products=[], mappings=[ChangeEvent.mapping_upsert("SYNC-C", "THEIR-1", item_number="SYNC-1", language_code="nl")])
-    assert rep2.skipped_unchanged == 2 and rep2.deleted == 1
+    assert rep2.skipped_unchanged == 2 and rep2.deleted == 0 and rep2.failed == 1 and "refusing to delete" in rep2.errors[0]
+    assert client.products.get("SYNC-1", "nl").description == "Sync test v2"
+    # the same run with the explicit opt-in: the product that disappeared from the ERP is deleted in AIOTIC
+    rep3 = eng.reconcile(products=[], allow_empty=True)
+    assert rep3.deleted == 1 and rep3.failed == 0
     eng.apply_many([ChangeEvent.mapping_delete("SYNC-C", "THEIR-1"), ChangeEvent.customer_delete("SYNC-C")])
 
 

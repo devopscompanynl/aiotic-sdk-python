@@ -384,9 +384,14 @@ class ProductUpsert(_Model):
     remark: str | None = None
 
 
-class Product(ProductUpsert):
+class Product(_Model):
+    """A product as AIOTIC returns it. ``description`` can be absent on records that were created without one;
+    writing a product (:class:`ProductUpsert`) still requires it, as the API does."""
+
     item_number: str
     language_code: str
+    description: str | None = None
+    remark: str | None = None
     created_at: datetime | None = None
 
 

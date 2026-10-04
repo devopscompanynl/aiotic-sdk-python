@@ -1,0 +1,99 @@
+# Publishes a GitHub release of this repository to PyPI with trusted publishing: no API token, PyPI trusts the
+# identity of this workflow (this repository, this file, the environment "pypi"). It uploads exactly the wheel and the
+# sdist attached to the release. Runs when a release is published, or by hand with the release tag of a version that
+# already has a release. The package version is read from the release's file names (PEP 440, for example 0.2.0rc1 for
+# the tag v0.2.0-rc.1), never derived from the tag by string manipulation.
+# Switch: the repository variable PYPI_PUBLISH must be "true" (Settings → Secrets and variables → Actions → Variables).
+name: publish-pypi
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag to publish, with or without the leading v (for example 0.1.1 or v0.2.0-rc.1); its GitHub release must exist
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-pypi
+  cancel-in-progress: false
+
+jobs:
+  pypi:
+    if: ${{ vars.PYPI_PUBLISH == 'true' }}
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # trusted publishing
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Resolve the release and its files
+        id: release
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG:-$INPUT_VERSION}"
+          tag="v${tag#v}"
+          # The tag is semantic versioning as the SDK writes it: vX.Y.Z, optionally -<pre-release>. Nothing else.
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::'$tag' is not a release tag of the form vX.Y.Z or vX.Y.Z-<pre-release>"; exit 1
+          fi
+          json=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,assets)
+          if [ "$(jq -r '.isDraft' <<<"$json")" != "false" ]; then
+            echo "::error::release $tag is a draft"; exit 1
+          fi
+          sdists=$(jq -r '.assets[].name | select(startswith("aiotic_sdk-") and endswith(".tar.gz"))' <<<"$json")
+          if [ -z "$sdists" ] || [ "$(wc -l <<<"$sdists")" -ne 1 ]; then
+            echo "::error::release $tag must carry exactly one sdist named aiotic_sdk-<version>.tar.gz"; exit 1
+          fi
+          # The package version is what the build wrote into the file name (PEP 440 public version, anchored).
+          pkgver="${sdists#aiotic_sdk-}"; pkgver="${pkgver%.tar.gz}"
+          if [[ ! "$pkgver" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$ ]]; then
+            echo "::error::'$pkgver' (from $sdists) is not a PEP 440 public version"; exit 1
+          fi
+          wheel="aiotic_sdk-$pkgver-py3-none-any.whl"
+          if [ "$(jq -r --arg w "$wheel" '[.assets[].name | select(. == $w)] | length' <<<"$json")" -ne 1 ]; then
+            echo "::error::release $tag has no asset $wheel"; exit 1
+          fi
+          printf 'tag=%s\nversion=%s\nwheel=%s\nsdist=%s\n' "$tag" "$pkgver" "$wheel" "$sdists" >> "$GITHUB_OUTPUT"
+          echo "release $tag → aiotic-sdk $pkgver ($wheel, $sdists)"
+      - name: Is this version on PyPI already?
+        id: index
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/aiotic-sdk/$VERSION/json")
+          case "$code" in
+            200) echo "present=true"  >> "$GITHUB_OUTPUT"; echo "aiotic-sdk $VERSION is on PyPI; nothing to upload" ;;
+            404) echo "present=false" >> "$GITHUB_OUTPUT"; echo "aiotic-sdk $VERSION is not on PyPI yet" ;;
+            *)   echo "::error::PyPI answered HTTP $code for aiotic-sdk $VERSION; refusing to guess"; exit 1 ;;
+          esac
+      - name: Download the release files (PyPI gets exactly these)
+        if: ${{ steps.index.outputs.present == 'false' }}
+        shell: bash
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          WHEEL: ${{ steps.release.outputs.wheel }}
+          SDIST: ${{ steps.release.outputs.sdist }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir dist --pattern "$WHEEL" --pattern "$SDIST"
+          ls -l dist
+          test -f "dist/$WHEEL" && test -f "dist/$SDIST" && test "$(ls dist | wc -l)" -eq 2
+      - name: Publish to PyPI (trusted publishing)
+        if: ${{ steps.index.outputs.present == 'false' }}
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist

@@ -14,7 +14,9 @@ Every method maps 1:1 to an endpoint of the public OpenAPI document; see the API
 from __future__ import annotations
 
 import time
+import uuid
 from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import IO, Any, BinaryIO
 from uuid import UUID
@@ -22,21 +24,23 @@ from uuid import UUID
 import httpx
 
 from . import models as m
-from ._transport import TokenBucket, backoff_delay, build_headers, raise_for_status, should_retry, transport_error
+from ._transport import IDEMPOTENT_METHODS, TokenBucket, backoff_delay, build_headers, path_segment, raise_for_status, replay_allowed, should_retry, transport_error
 from .config import Settings
 from .errors import AioticError
 
 FileInput = str | Path | tuple[str, bytes] | tuple[str, BinaryIO] | tuple[str, bytes, str]
 
 
-def _file_tuple(f: FileInput) -> tuple[str, Any, str | None]:
+def _file_tuple(f: FileInput) -> tuple[str, bytes, str | None]:
+    """Normalise a file input to ``(name, bytes, content_type)``. File objects are read once here, so a request
+    that has to be sent again carries the complete body."""
     if isinstance(f, (str, Path)):
         p = Path(f)
         return (p.name, p.read_bytes(), None)
-    if len(f) == 3:
-        return (f[0], f[1], f[2])  # type: ignore[misc]
-    name, data = f  # type: ignore[misc]
-    return (name, data, None)
+    name, data, *rest = f
+    if hasattr(data, "read"):
+        data = data.read()
+    return (name, data, rest[0] if rest else None)
 
 
 class _Resource:
@@ -56,32 +60,34 @@ class Orders(_Resource):
     ) -> m.OrderUploadResponse:
         """Upload one or more files that together form ONE purchase order.
 
-        ``request_id`` (UUID v4) makes the upload idempotent and lets you correlate the order.
-        Extra ``metadata`` form fields are stored on the order and echoed back by the status endpoints.
+        ``request_id`` (UUID v4) makes the upload idempotent and lets you correlate the order. When you do not
+        pass one, the client generates it once per call, so a request that has to be sent again after a lost
+        response creates no second order. Extra ``metadata`` form fields are stored on the order and echoed
+        back by the status endpoints.
         """
         data: dict[str, str] = dict(metadata or {})
-        if request_id:
-            data["request_id"] = str(request_id)
+        data["request_id"] = str(request_id) if request_id else str(uuid.uuid4())
         multipart = [("files", _file_tuple(f)) for f in files]
-        r = self._c._request("POST", "/order/upload", data=data, files=multipart)
+        r = self._c._request("POST", "/order/upload", data=data, files=multipart, idempotent=True)
         return m.OrderUploadResponse.model_validate(r.json())
 
     def upload_raw_email(self, eml: FileInput, *, request_id: UUID | str | None = None) -> m.OrderUploadResponse:
         """Upload a raw ``.eml``. Branch on ``response.split`` and poll ``response.request_ids``.
 
         Raises :class:`aiotic.AioticValidationError` with a structured ``detail`` when the e-mail is
-        not a purchase order (``detail["error"] == "not_a_purchase_order"``).
+        not a purchase order (``detail["error"] == "not_a_purchase_order"``). The API does not promise
+        idempotency for this endpoint, so the client never sends it again once it may have been received.
         """
         data = {"request_id": str(request_id)} if request_id else {}
         r = self._c._request("POST", "/order/raw/upload", data=data, files=[("file", _file_tuple(eml))])
         return m.OrderUploadResponse.model_validate(r.json())
 
     def classify_raw_email(self, eml: FileInput) -> m.EmailClassification:
-        r = self._c._request("POST", "/order/raw/classify", files=[("file", _file_tuple(eml))])
+        r = self._c._request("POST", "/order/raw/classify", files=[("file", _file_tuple(eml))], idempotent=True)
         return m.EmailClassification.model_validate(r.json())
 
     def get(self, request_id: UUID | str) -> m.OrderStatus:
-        r = self._c._request("GET", f"/order_status/{request_id}")
+        r = self._c._request("GET", f"/order_status/{path_segment(request_id, what='request_id')}")
         return m.OrderStatus.model_validate(r.json())
 
     def list(self, *, page: int = 1, size: int = 100) -> m.OrderListResponse:
@@ -99,18 +105,18 @@ class Orders(_Resource):
             page += 1
 
     def group(self, email_group_id: UUID | str) -> m.OrderGroup:
-        r = self._c._request("GET", f"/order/group/{email_group_id}")
+        r = self._c._request("GET", f"/order/group/{path_segment(email_group_id, what='email_group_id')}")
         return m.OrderGroup.model_validate(r.json())
 
     def download_file(self, request_id: UUID | str, filename: str, *, preview: bool = False) -> bytes:
         """Download an original upload or a generated artifact such as ``latest_result.json``."""
         suffix = "/preview" if preview else ""
-        r = self._c._request("GET", f"/order/{request_id}/{filename}{suffix}", stream=True)
+        r = self._c._request("GET", f"/order/{path_segment(request_id, what='request_id')}/{path_segment(filename, what='filename')}{suffix}", stream=True)
         return r.content
 
     def retry(self, request_id: UUID | str) -> m.OrderUploadResponse:
         """Retry a FAILED order. Returns the NEW request id; the old order becomes REPROCESSED."""
-        r = self._c._request("POST", f"/order/retry/{request_id}")
+        r = self._c._request("POST", f"/order/retry/{path_segment(request_id, what='request_id')}")
         return m.OrderUploadResponse.model_validate(r.json())
 
     def wait(
@@ -141,7 +147,7 @@ class Erp(_Resource):
 
     def send(self, request_id: UUID | str) -> m.ErpSendResponse:
         """Hand a sendable order to your ERP receive endpoint. Raises ``AioticErpRejectedError`` on ``success: false``."""
-        r = self._c._request("POST", f"/erp/send/{request_id}")
+        r = self._c._request("POST", f"/erp/send/{path_segment(request_id, what='request_id')}")
         return m.ErpSendResponse.model_validate(r.json())
 
 
@@ -153,11 +159,11 @@ class Rejected(_Resource):
         return m.RejectedEmailListResponse.model_validate(r.json())
 
     def get(self, request_id: UUID | str) -> m.ClassifiedEmail:
-        r = self._c._request("GET", f"/rejected/{request_id}")
+        r = self._c._request("GET", f"/rejected/{path_segment(request_id, what='request_id')}")
         return m.ClassifiedEmail.model_validate(r.json())
 
     def reprocess(self, request_id: UUID | str) -> m.ReprocessResponse:
-        r = self._c._request("POST", f"/rejected/{request_id}/reprocess")
+        r = self._c._request("POST", f"/rejected/{path_segment(request_id, what='request_id')}/reprocess")
         return m.ReprocessResponse.model_validate(r.json())
 
 
@@ -178,20 +184,20 @@ class Customers(_Resource):
             page += 1
 
     def search(self, query: str, *, top_k: int = 10) -> m.CustomerSearchResponse:
-        r = self._c._request("GET", f"/customer/search/{httpx.URL(path=query).path.lstrip('/')}", params={"top_k": top_k})
+        r = self._c._request("GET", f"/customer/search/{path_segment(query, what='query')}", params={"top_k": top_k})
         return m.CustomerSearchResponse.model_validate(r.json())
 
     def get(self, number: str) -> m.Customer:
-        r = self._c._request("GET", f"/customer/{number}")
+        r = self._c._request("GET", f"/customer/{path_segment(number, what='customer number')}")
         return m.Customer.model_validate(r.json())
 
     def upsert(self, number: str, data: m.CustomerUpsert | dict[str, Any]) -> m.Customer:
         body = data if isinstance(data, dict) else data.model_dump(mode="json", exclude_none=True)
-        r = self._c._request("PUT", f"/customer/{number}", json=body)
+        r = self._c._request("PUT", f"/customer/{path_segment(number, what='customer number')}", json=body)
         return m.Customer.model_validate(r.json())
 
     def delete(self, number: str) -> None:
-        self._c._request("DELETE", f"/customer/{number}")
+        self._c._request("DELETE", f"/customer/{path_segment(number, what='customer number')}")
 
 
 class Products(_Resource):
@@ -214,16 +220,16 @@ class Products(_Resource):
             page += 1
 
     def get(self, item_number: str, language_code: str) -> m.Product:
-        r = self._c._request("GET", f"/product/{item_number}/{language_code}")
+        r = self._c._request("GET", f"/product/{path_segment(item_number, what='item number')}/{path_segment(language_code, what='language code')}")
         return m.Product.model_validate(r.json())
 
     def upsert(self, item_number: str, language_code: str, data: m.ProductUpsert | dict[str, Any]) -> m.Product:
         body = data if isinstance(data, dict) else data.model_dump(mode="json", exclude_none=True)
-        r = self._c._request("PUT", f"/product/{item_number}/{language_code}", json=body)
+        r = self._c._request("PUT", f"/product/{path_segment(item_number, what='item number')}/{path_segment(language_code, what='language code')}", json=body)
         return m.Product.model_validate(r.json())
 
     def delete(self, item_number: str, language_code: str) -> None:
-        self._c._request("DELETE", f"/product/{item_number}/{language_code}")
+        self._c._request("DELETE", f"/product/{path_segment(item_number, what='item number')}/{path_segment(language_code, what='language code')}")
 
 
 class CustomerProducts(_Resource):
@@ -264,18 +270,18 @@ class CustomerProducts(_Resource):
             page += 1
 
     def get(self, customer_number: str, customer_item_number: str) -> m.CustomerProduct:
-        r = self._c._request("GET", f"/customer-product/{customer_number}/{customer_item_number}")
+        r = self._c._request("GET", f"/customer-product/{path_segment(customer_number, what='customer number')}/{path_segment(customer_item_number, what='customer item number')}")
         return m.CustomerProduct.model_validate(r.json())
 
     def upsert(
         self, customer_number: str, customer_item_number: str, data: m.CustomerProductUpsert | dict[str, Any]
     ) -> m.CustomerProduct:
         body = data if isinstance(data, dict) else data.model_dump(mode="json", exclude_none=True)
-        r = self._c._request("PUT", f"/customer-product/{customer_number}/{customer_item_number}", json=body)
+        r = self._c._request("PUT", f"/customer-product/{path_segment(customer_number, what='customer number')}/{path_segment(customer_item_number, what='customer item number')}", json=body)
         return m.CustomerProduct.model_validate(r.json())
 
     def delete(self, customer_number: str, customer_item_number: str) -> None:
-        self._c._request("DELETE", f"/customer-product/{customer_number}/{customer_item_number}")
+        self._c._request("DELETE", f"/customer-product/{path_segment(customer_number, what='customer number')}/{path_segment(customer_item_number, what='customer item number')}")
 
 
 class Mailbox(_Resource):
@@ -299,7 +305,8 @@ class AioticClient:
         rate_limit: float | None = None,
         transport: httpx.BaseTransport | None = None,
     ):
-        s = settings or Settings.from_env()
+        # Work on a private copy: two clients may share one Settings object, and the caller may keep changing it.
+        s = replace(settings) if settings is not None else Settings.from_env()
         if base_url:
             s.base_url = base_url.rstrip("/")
         if api_key:
@@ -352,7 +359,12 @@ class AioticClient:
         files: list[tuple[str, tuple[str, Any, str | None]]] | None = None,
         auth: bool = True,
         stream: bool = False,
+        idempotent: bool | None = None,
     ) -> httpx.Response:
+        """One API call with retries. ``idempotent`` decides whether a request may be sent a second time when the
+        outcome of the first one is unknown; by default only GET, PUT and DELETE are (see :mod:`aiotic._transport`)."""
+        if idempotent is None:
+            idempotent = method in IDEMPOTENT_METHODS
         headers = build_headers(self.settings, path) if auth else {}
         last_exc: Exception | None = None
         for attempt in range(self.settings.max_retries + 1):
@@ -361,11 +373,11 @@ class AioticClient:
                 response = self._http.request(method, path, params=params, json=json, data=data, files=files, headers=headers)
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 last_exc = exc
-                if attempt >= self.settings.max_retries or (files and attempt > 0):
+                if attempt >= self.settings.max_retries or not replay_allowed(exc, idempotent=idempotent):
                     raise transport_error(exc, path) from exc
                 time.sleep(backoff_delay(attempt))
                 continue
-            if should_retry(response, method) and attempt < self.settings.max_retries:
+            if should_retry(response, method, idempotent=idempotent) and attempt < self.settings.max_retries:
                 time.sleep(backoff_delay(attempt, response.headers.get("Retry-After")))
                 continue
             raise_for_status(response, path)

@@ -7,14 +7,16 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
+from dataclasses import replace
 from typing import Any
 from uuid import UUID
 
 import httpx
 
 from . import models as m
-from ._transport import TokenBucket, backoff_delay, build_headers, raise_for_status, should_retry, transport_error
+from ._transport import IDEMPOTENT_METHODS, TokenBucket, backoff_delay, build_headers, path_segment, raise_for_status, replay_allowed, should_retry, transport_error
 from .client import FileInput, _file_tuple
 from .config import Settings
 from .errors import AioticError
@@ -30,9 +32,8 @@ class AsyncOrders(_AResource):
         self, files: Sequence[FileInput], *, request_id: UUID | str | None = None, metadata: dict[str, str] | None = None
     ) -> m.OrderUploadResponse:
         data: dict[str, str] = dict(metadata or {})
-        if request_id:
-            data["request_id"] = str(request_id)
-        r = await self._c._request("POST", "/order/upload", data=data, files=[("files", _file_tuple(f)) for f in files])
+        data["request_id"] = str(request_id) if request_id else str(uuid.uuid4())  # generated once: a replay creates no second order
+        r = await self._c._request("POST", "/order/upload", data=data, files=[("files", _file_tuple(f)) for f in files], idempotent=True)
         return m.OrderUploadResponse.model_validate(r.json())
 
     async def upload_raw_email(self, eml: FileInput, *, request_id: UUID | str | None = None) -> m.OrderUploadResponse:
@@ -41,11 +42,11 @@ class AsyncOrders(_AResource):
         return m.OrderUploadResponse.model_validate(r.json())
 
     async def classify_raw_email(self, eml: FileInput) -> m.EmailClassification:
-        r = await self._c._request("POST", "/order/raw/classify", files=[("file", _file_tuple(eml))])
+        r = await self._c._request("POST", "/order/raw/classify", files=[("file", _file_tuple(eml))], idempotent=True)
         return m.EmailClassification.model_validate(r.json())
 
     async def get(self, request_id: UUID | str) -> m.OrderStatus:
-        r = await self._c._request("GET", f"/order_status/{request_id}")
+        r = await self._c._request("GET", f"/order_status/{path_segment(request_id, what='request_id')}")
         return m.OrderStatus.model_validate(r.json())
 
     async def list(self, *, page: int = 1, size: int = 100) -> m.OrderListResponse:
@@ -63,15 +64,15 @@ class AsyncOrders(_AResource):
             page += 1
 
     async def group(self, email_group_id: UUID | str) -> m.OrderGroup:
-        r = await self._c._request("GET", f"/order/group/{email_group_id}")
+        r = await self._c._request("GET", f"/order/group/{path_segment(email_group_id, what='email_group_id')}")
         return m.OrderGroup.model_validate(r.json())
 
     async def download_file(self, request_id: UUID | str, filename: str, *, preview: bool = False) -> bytes:
-        r = await self._c._request("GET", f"/order/{request_id}/{filename}{'/preview' if preview else ''}")
+        r = await self._c._request("GET", f"/order/{path_segment(request_id, what='request_id')}/{path_segment(filename, what='filename')}{'/preview' if preview else ''}")
         return r.content
 
     async def retry(self, request_id: UUID | str) -> m.OrderUploadResponse:
-        r = await self._c._request("POST", f"/order/retry/{request_id}")
+        r = await self._c._request("POST", f"/order/retry/{path_segment(request_id, what='request_id')}")
         return m.OrderUploadResponse.model_validate(r.json())
 
     async def wait(
@@ -99,7 +100,7 @@ class AsyncOrders(_AResource):
 
 class AsyncErp(_AResource):
     async def send(self, request_id: UUID | str) -> m.ErpSendResponse:
-        r = await self._c._request("POST", f"/erp/send/{request_id}")
+        r = await self._c._request("POST", f"/erp/send/{path_segment(request_id, what='request_id')}")
         return m.ErpSendResponse.model_validate(r.json())
 
 
@@ -109,10 +110,10 @@ class AsyncRejected(_AResource):
         return m.RejectedEmailListResponse.model_validate(r.json())
 
     async def get(self, request_id: UUID | str) -> m.ClassifiedEmail:
-        return m.ClassifiedEmail.model_validate((await self._c._request("GET", f"/rejected/{request_id}")).json())
+        return m.ClassifiedEmail.model_validate((await self._c._request("GET", f"/rejected/{path_segment(request_id, what='request_id')}")).json())
 
     async def reprocess(self, request_id: UUID | str) -> m.ReprocessResponse:
-        return m.ReprocessResponse.model_validate((await self._c._request("POST", f"/rejected/{request_id}/reprocess")).json())
+        return m.ReprocessResponse.model_validate((await self._c._request("POST", f"/rejected/{path_segment(request_id, what='request_id')}/reprocess")).json())
 
 
 class AsyncCustomers(_AResource):
@@ -131,18 +132,18 @@ class AsyncCustomers(_AResource):
             page += 1
 
     async def search(self, query: str, *, top_k: int = 10) -> m.CustomerSearchResponse:
-        r = await self._c._request("GET", f"/customer/search/{httpx.URL(path=query).path.lstrip('/')}", params={"top_k": top_k})
+        r = await self._c._request("GET", f"/customer/search/{path_segment(query, what='query')}", params={"top_k": top_k})
         return m.CustomerSearchResponse.model_validate(r.json())
 
     async def get(self, number: str) -> m.Customer:
-        return m.Customer.model_validate((await self._c._request("GET", f"/customer/{number}")).json())
+        return m.Customer.model_validate((await self._c._request("GET", f"/customer/{path_segment(number, what='customer number')}")).json())
 
     async def upsert(self, number: str, data: m.CustomerUpsert | dict[str, Any]) -> m.Customer:
         body = data if isinstance(data, dict) else data.model_dump(mode="json", exclude_none=True)
-        return m.Customer.model_validate((await self._c._request("PUT", f"/customer/{number}", json=body)).json())
+        return m.Customer.model_validate((await self._c._request("PUT", f"/customer/{path_segment(number, what='customer number')}", json=body)).json())
 
     async def delete(self, number: str) -> None:
-        await self._c._request("DELETE", f"/customer/{number}")
+        await self._c._request("DELETE", f"/customer/{path_segment(number, what='customer number')}")
 
 
 class AsyncProducts(_AResource):
@@ -163,15 +164,15 @@ class AsyncProducts(_AResource):
             page += 1
 
     async def get(self, item_number: str, language_code: str) -> m.Product:
-        return m.Product.model_validate((await self._c._request("GET", f"/product/{item_number}/{language_code}")).json())
+        return m.Product.model_validate((await self._c._request("GET", f"/product/{path_segment(item_number, what='item number')}/{path_segment(language_code, what='language code')}")).json())
 
     async def upsert(self, item_number: str, language_code: str, data: m.ProductUpsert | dict[str, Any]) -> m.Product:
         body = data if isinstance(data, dict) else data.model_dump(mode="json", exclude_none=True)
-        r = await self._c._request("PUT", f"/product/{item_number}/{language_code}", json=body)
+        r = await self._c._request("PUT", f"/product/{path_segment(item_number, what='item number')}/{path_segment(language_code, what='language code')}", json=body)
         return m.Product.model_validate(r.json())
 
     async def delete(self, item_number: str, language_code: str) -> None:
-        await self._c._request("DELETE", f"/product/{item_number}/{language_code}")
+        await self._c._request("DELETE", f"/product/{path_segment(item_number, what='item number')}/{path_segment(language_code, what='language code')}")
 
 
 class AsyncCustomerProducts(_AResource):
@@ -191,18 +192,18 @@ class AsyncCustomerProducts(_AResource):
             page += 1
 
     async def get(self, customer_number: str, customer_item_number: str) -> m.CustomerProduct:
-        r = await self._c._request("GET", f"/customer-product/{customer_number}/{customer_item_number}")
+        r = await self._c._request("GET", f"/customer-product/{path_segment(customer_number, what='customer number')}/{path_segment(customer_item_number, what='customer item number')}")
         return m.CustomerProduct.model_validate(r.json())
 
     async def upsert(
         self, customer_number: str, customer_item_number: str, data: m.CustomerProductUpsert | dict[str, Any]
     ) -> m.CustomerProduct:
         body = data if isinstance(data, dict) else data.model_dump(mode="json", exclude_none=True)
-        r = await self._c._request("PUT", f"/customer-product/{customer_number}/{customer_item_number}", json=body)
+        r = await self._c._request("PUT", f"/customer-product/{path_segment(customer_number, what='customer number')}/{path_segment(customer_item_number, what='customer item number')}", json=body)
         return m.CustomerProduct.model_validate(r.json())
 
     async def delete(self, customer_number: str, customer_item_number: str) -> None:
-        await self._c._request("DELETE", f"/customer-product/{customer_number}/{customer_item_number}")
+        await self._c._request("DELETE", f"/customer-product/{path_segment(customer_number, what='customer number')}/{path_segment(customer_item_number, what='customer item number')}")
 
 
 class AsyncMailbox(_AResource):
@@ -223,7 +224,7 @@ class AsyncAioticClient:
         rate_limit: float | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
-        s = settings or Settings.from_env()
+        s = replace(settings) if settings is not None else Settings.from_env()  # a private copy, see AioticClient
         if base_url:
             s.base_url = base_url.rstrip("/")
         if api_key:
@@ -272,7 +273,10 @@ class AsyncAioticClient:
         data: dict[str, str] | None = None,
         files: list[tuple[str, tuple[str, Any, str | None]]] | None = None,
         auth: bool = True,
+        idempotent: bool | None = None,
     ) -> httpx.Response:
+        if idempotent is None:
+            idempotent = method in IDEMPOTENT_METHODS
         headers = build_headers(self.settings, path) if auth else {}
         last_exc: Exception | None = None
         for attempt in range(self.settings.max_retries + 1):
@@ -281,11 +285,11 @@ class AsyncAioticClient:
                 response = await self._http.request(method, path, params=params, json=json, data=data, files=files, headers=headers)
             except (httpx.TransportError, httpx.TimeoutException) as exc:
                 last_exc = exc
-                if attempt >= self.settings.max_retries or (files and attempt > 0):
+                if attempt >= self.settings.max_retries or not replay_allowed(exc, idempotent=idempotent):
                     raise transport_error(exc, path) from exc
                 await asyncio.sleep(backoff_delay(attempt))
                 continue
-            if should_retry(response, method) and attempt < self.settings.max_retries:
+            if should_retry(response, method, idempotent=idempotent) and attempt < self.settings.max_retries:
                 await asyncio.sleep(backoff_delay(attempt, response.headers.get("Retry-After")))
                 continue
             raise_for_status(response, path)

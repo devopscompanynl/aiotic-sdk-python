@@ -33,6 +33,9 @@ aiotic = "aiotic.cli:main"
 [project.urls]
 Documentation = "https://developers.aiotic.ai"
 Homepage = "https://www.aiotic.ai"
+Changelog = "https://github.com/devopscompanynl/aiotic-sdk-python/blob/main/CHANGELOG.md"
+Source = "https://github.com/devopscompanynl/aiotic-sdk-python"
+Issues = "https://github.com/devopscompanynl/aiotic-sdk-python/issues"
 
 [build-system]
 requires = ["hatchling>=1.25"]

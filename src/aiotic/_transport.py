@@ -8,14 +8,23 @@ import random
 import threading
 import time
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
 from ._version import __version__
 from .config import Settings
-from .errors import AioticTransportError, error_for_status
+from .errors import AioticIdentifierError, AioticTransportError, error_for_status
 
 RETRY_STATUSES = frozenset({408, 425, 429, 502, 503, 504})
+# With these statuses the server did not process the request, so even a request that is not idempotent can be sent
+# again: 408 (the request never arrived completely), 425 (not accepted yet), 429 (rejected before processing).
+# 503 is deliberately absent: an intermediary can answer 503 after the upstream connection broke, that is, after the
+# backend may already have applied the request. 502 and 504 are ambiguous for the same reason.
+NOT_PROCESSED_STATUSES = frozenset({408, 425, 429})
+# Transport failures that happen before anything was sent: safe to repeat for any operation.
+NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE"})
 SYNC_KEY_PREFIXES = ("/customer/", "/product/", "/customer-product/")
 
 
@@ -90,13 +99,39 @@ def raise_for_status(response: httpx.Response, path: str) -> None:
     raise error_for_status(response.status_code, detail, path=path, request_id=request_id)
 
 
-def should_retry(response: httpx.Response | None, method: str) -> bool:
-    if response is None:
-        return True  # transport error
+def should_retry(response: httpx.Response, method: str, *, idempotent: bool = True) -> bool:
+    """Whether a response may be answered with another attempt.
+
+    Idempotent requests (GET, PUT, DELETE, and uploads that carry a ``request_id``) are retried on every status in
+    :data:`RETRY_STATUSES`. Other POSTs are retried only when the status proves the request was not processed
+    (:data:`NOT_PROCESSED_STATUSES`); a 502, 503 or 504 after an order retry, a raw e-mail upload or an ERP send may
+    have gone through and is surfaced instead.
+    """
     if response.status_code not in RETRY_STATUSES:
         return False
     # Never blindly retry an ERP send on 503 (integration not configured) — surface it.
-    return not (method == "POST" and response.request.url.path.startswith("/erp/send") and response.status_code == 503)
+    if method == "POST" and response.request.url.path.startswith("/erp/send") and response.status_code == 503:
+        return False
+    return idempotent or response.status_code in NOT_PROCESSED_STATUSES
+
+
+def replay_allowed(exc: Exception, *, idempotent: bool) -> bool:
+    """Whether a request that failed with a transport error may be sent again: always for idempotent requests,
+    otherwise only when the failure happened before the request was sent."""
+    return idempotent or isinstance(exc, NOT_SENT_ERRORS)
+
+
+def path_segment(value: Any, *, what: str = "identifier") -> str:
+    """Encode one value as a single URL path segment (``#``, ``?``, ``%``, spaces and non-ASCII are percent-encoded).
+
+    Values that cannot travel as one segment are refused before any request: empty strings, the dot segments
+    ``.`` and ``..``, and anything containing a slash, a backslash or a control character. Servers decode and
+    normalise those differently, so encoding them could address another record.
+    """
+    text = str(value)
+    if not text or text in (".", "..") or "/" in text or "\\" in text or any(ord(ch) < 32 or ch == "\x7f" for ch in text):
+        raise AioticIdentifierError(f"{what} {text!r} cannot be sent as a URL path segment")
+    return quote(text, safe="")
 
 
 def transport_error(exc: Exception, path: str) -> AioticTransportError:

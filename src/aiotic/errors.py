@@ -62,6 +62,11 @@ class AioticTransportError(AioticError):
     """Network problem after all retries were exhausted."""
 
 
+class AioticIdentifierError(AioticError, ValueError):
+    """A customer number, item number, file name or search text cannot be sent safely as one URL path segment
+    (it is empty, a dot segment, or contains a slash or a control character). Raised before any request is made."""
+
+
 def error_for_status(status: int, detail: Any, *, path: str, request_id: str | None = None) -> AioticError:
     """Map an HTTP status + body to the right exception."""
     text = detail if isinstance(detail, str) else (detail.get("message") if isinstance(detail, dict) else None)

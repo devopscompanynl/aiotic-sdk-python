@@ -89,8 +89,15 @@ def verify_hmac_signature(secret: str, body: bytes, signature_header: str | None
 
 
 def create_webhook_routers(*, processing: ProcessingWebhookReceiver | None = None, on_change_events: Callable[[list[ChangeEvent]], Any] | None = None, erp_events_key: str | None = None) -> Any:
-    """FastAPI router with ``POST /aiotic/processing`` and ``POST /erp/events``. Requires the ``server`` extra."""
+    """FastAPI router with ``POST /aiotic/processing`` and ``POST /erp/events``. Requires the ``server`` extra.
+
+    ``POST /erp/events`` writes to AIOTIC through the sync engine, so it is only mounted with a non-empty
+    ``erp_events_key``; passing ``on_change_events`` without a key raises ``ValueError``.
+    """
     from fastapi import APIRouter, Header, Request, Response
+
+    if on_change_events is not None and not erp_events_key:
+        raise ValueError("erp_events_key is required when on_change_events is set: POST /erp/events writes to AIOTIC and is never left open")
 
     router = APIRouter()
 
@@ -106,7 +113,7 @@ def create_webhook_routers(*, processing: ProcessingWebhookReceiver | None = Non
 
         @router.post("/erp/events", summary="ERP change events → sync engine")
         async def erp_events(request: Request, response: Response, x_api_key: str | None = Header(default=None, alias="X-API-KEY")) -> dict[str, Any]:
-            if erp_events_key and not (x_api_key and hmac.compare_digest(x_api_key.encode(), erp_events_key.encode())):
+            if not (x_api_key and hmac.compare_digest(x_api_key.encode(), erp_events_key.encode())):
                 response.status_code = 401
                 return {"detail": "invalid X-API-KEY"}
             events = parse_change_events(await request.json())

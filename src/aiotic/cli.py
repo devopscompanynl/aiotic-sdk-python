@@ -55,6 +55,8 @@ AIOTIC_SYNC_API_KEY=
 AIOTIC_ERP_RECEIVE_KEY={receive_key}
 # The key AIOTIC sends to your processing webhook (optional feature)
 AIOTIC_WEBHOOK_KEY=
+# The key YOUR ERP sends when it posts change events to /erp/events (optional; defaults to the receive key)
+AIOTIC_ERP_EVENTS_KEY=
 AIOTIC_RATE_LIMIT=10
 """
 
@@ -111,7 +113,7 @@ def doctor() -> None:
 
     row("AIOTIC_BASE_URL", bool(s.base_url), s.base_url or "missing")
     row("AIOTIC_API_KEY", bool(s.api_key), "set" if s.api_key else "missing")
-    row("AIOTIC_ERP_RECEIVE_KEY", bool(s.erp_receive_key), "set" if s.erp_receive_key else "missing (receive endpoint unauthenticated placeholder)")
+    row("AIOTIC_ERP_RECEIVE_KEY", bool(s.erp_receive_key), "set" if s.erp_receive_key else "missing (the service refuses to start without it)")
     if s.base_url and s.api_key:
         try:
             c = AioticClient(settings=s)
@@ -189,12 +191,81 @@ def orders_watch(interval: float = 15.0, state: str = "aiotic-watch-state.db") -
     OrderWatcher(c, on_transition=lambda t: rprint(transition_to_json(t)), state=SqliteWatchState(state), interval=interval).run_forever()
 
 
-def _read_rows(path: Path) -> list[dict[str, Any]]:
+REQUIRED_COLUMNS: dict[str, tuple[set[str], ...]] = {
+    "customers": ({"number"}, {"customer_number"}),
+    "products": ({"item_number", "description"},),
+    "mappings": ({"customer_number", "customer_item_number", "item_number"},),
+}
+
+
+def _no_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    seen: set[str] = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r} in one record")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _read_rows(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    """Rows and column names from a CSV (comma or semicolon separated, UTF-8 with or without BOM) or a JSON file
+    (a list of records, or ``{"items": [...]}``).
+
+    Anything ambiguous is a usage error, never an empty or reshaped data set: a header with duplicate names (after
+    trimming, ignoring case), a row with more or fewer fields than the header, malformed quoting (an unterminated
+    quoted field would swallow the rows after it), a JSON record with a duplicate key. Each of those could change
+    which record a value belongs to, which matters when the result drives deletions.
+    """
     if path.suffix.lower() == ".json":
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else data.get("items", [])
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"), object_pairs_hook=_no_duplicate_keys)
+        except json.JSONDecodeError as exc:
+            raise typer.BadParameter(f"{path}: not valid JSON ({exc.msg} at line {exc.lineno})")
+        except ValueError as exc:
+            raise typer.BadParameter(f"{path}: {exc}")
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            data = data["items"]
+        if not isinstance(data, list) or not all(isinstance(r, dict) for r in data):
+            raise typer.BadParameter(f'{path}: expected a JSON list of records or {{"items": [...]}}')
+        return data, sorted({k for r in data for k in r})
     with path.open(newline="", encoding="utf-8-sig") as fh:
-        return [dict(r) for r in csv.DictReader(fh, delimiter=";" if ";" in fh.readline() and not fh.seek(0) else ",")]
+        head = fh.readline()
+        if not head.strip():
+            raise typer.BadParameter(f"{path}: empty file, no header row")
+        delimiter = ";" if head.count(";") > head.count(",") else ","
+        fh.seek(0)
+        reader = csv.reader(fh, delimiter=delimiter, strict=True)  # strict: bad quoting is an error, not a repair
+        rows: list[dict[str, Any]] = []
+        try:
+            columns = [c.strip() for c in next(reader)]
+            if not columns or any(not c for c in columns):
+                raise typer.BadParameter(f"{path}: malformed header row: {head.strip()!r}")
+            normalized = [c.casefold() for c in columns]
+            duplicates = sorted({c for c in normalized if normalized.count(c) > 1})
+            if duplicates:
+                raise typer.BadParameter(f"{path}: duplicate column(s) in the header: {', '.join(duplicates)}")
+            for values in reader:
+                if not values or (len(values) == 1 and not values[0].strip()):
+                    continue  # a blank line
+                if len(values) != len(columns):
+                    raise typer.BadParameter(f"{path}: line {reader.line_num} has {len(values)} field(s), the header has {len(columns)}")
+                rows.append(dict(zip(columns, values)))
+        except csv.Error as exc:
+            raise typer.BadParameter(f"{path}: malformed CSV near line {reader.line_num}: {exc}")
+        return rows, columns
+
+
+def _check_columns(kind: str, columns: list[str], source: Path) -> None:
+    options = REQUIRED_COLUMNS[kind]
+    if not any(req <= set(columns) for req in options):
+        wanted = " or ".join(", ".join(sorted(o)) for o in options)
+        raise typer.BadParameter(f"{source}: a {kind} file needs the column(s) {wanted}; found: {', '.join(columns) or 'none'}")
+
+
+def _load(kind: str, source: Path) -> list[Any]:
+    rows, columns = _read_rows(source)
+    _check_columns(kind, columns, source)
+    return _events(kind, rows)
 
 
 def _events(kind: str, rows: list[dict[str, Any]]) -> list[Any]:
@@ -223,7 +294,8 @@ for _kind in ("customers", "products", "mappings"):
 
     def _make(kind: str) -> Any:
         def cmd(source: Path = typer.Option(..., "--from", help="CSV or JSON file"), state: str = "aiotic-sync-state.db", dry_run: bool = False, concurrency: int = 4, force: bool = False) -> None:
-            rep = _engine(state, dry_run, concurrency).apply_many(_events(kind, _read_rows(source)), force=force)
+            events = _load(kind, source)
+            rep = _engine(state, dry_run, concurrency).apply_many(events, force=force)
             rprint(f"{kind}: {rep}")
             for e in rep.errors[:20]:
                 rprint(f"  [red]{e}[/red]")
@@ -237,16 +309,30 @@ for _kind in ("customers", "products", "mappings"):
 
 
 @sync_app.command("reconcile")
-def sync_reconcile(customers: Path | None = None, products: Path | None = None, mappings: Path | None = None, state: str = "aiotic-sync-state.db", delete_missing: bool = True, dry_run: bool = False) -> None:
-    """Safety net: send only differences vs. the last known state; delete records that disappeared."""
+def sync_reconcile(
+    customers: Path | None = None,
+    products: Path | None = None,
+    mappings: Path | None = None,
+    state: str = "aiotic-sync-state.db",
+    delete_missing: bool = True,
+    dry_run: bool = False,
+    allow_empty: bool = typer.Option(False, "--allow-empty", help="An empty file really means: delete everything of that kind that was sent earlier"),
+) -> None:
+    """Safety net: send only differences vs. the last known state; delete records that disappeared.
+
+    Files are validated first (header, required columns, JSON shape); an empty data set never deletes anything
+    unless --allow-empty is given.
+    """
+    sources = {
+        "customers": _load("customers", customers) if customers else None,
+        "products": _load("products", products) if products else None,
+        "mappings": _load("mappings", mappings) if mappings else None,
+    }
     eng = _engine(state, dry_run, 4)
-    rep = eng.reconcile(
-        customers=_events("customers", _read_rows(customers)) if customers else None,
-        products=_events("products", _read_rows(products)) if products else None,
-        mappings=_events("mappings", _read_rows(mappings)) if mappings else None,
-        delete_missing=delete_missing,
-    )
+    rep = eng.reconcile(**sources, delete_missing=delete_missing, allow_empty=allow_empty)
     rprint(f"reconcile: {rep}")
+    for e in rep.errors[:20]:
+        rprint(f"  [red]{e}[/red]")
     raise typer.Exit(1 if rep.failed else 0)
 
 

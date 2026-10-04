@@ -15,21 +15,37 @@ pip install "aiotic-sdk[all]"        # client + FastAPI service + CLI
 pip install aiotic-sdk               # client and validation pipeline only (httpx, pydantic)
 ```
 
-Python 3.11 or newer. Until the package is on PyPI, install the wheel attached to the latest
-[GitHub release](https://github.com/devopscompanynl/aiotic-sdk-python/releases), for example:
+Python 3.11 or newer. Every release is also attached to the
+[GitHub releases](https://github.com/devopscompanynl/aiotic-sdk-python/releases) as a wheel and an sdist.
+
+## Quick start
+
+The full walkthrough, copy-paste ready, runs a mock AIOTIC tenant, a receive endpoint and a demo ERP in about
+15 minutes: **[Quick start in the Integrator Guide](https://developers.aiotic.ai/guide/quick-start)**. The short
+version:
 
 ```bash
-pip install "aiotic-sdk[all] @ https://github.com/devopscompanynl/aiotic-sdk-python/releases/download/vX.Y.Z/aiotic_sdk-X.Y.Z-py3-none-any.whl"
-```
-
-## Five commands to a running integration
-
-```bash
-aiotic init                          # writes .env + service.py
+pip install "aiotic-sdk[all]"
 aiotic mock &                        # a local AIOTIC tenant on :8080 (keys: mock-integration-key / mock-sync-key)
+aiotic init                          # asks for the tenant URL and key, writes .env + service.py
 aiotic doctor                        # connectivity, keys, master data present?
 aiotic serve                         # your receive endpoint + webhooks on :9000
 ```
+
+Your first call from Python, with the `.env` that `aiotic init` wrote:
+
+```python
+from aiotic import AioticClient
+
+with AioticClient() as client:                        # reads AIOTIC_BASE_URL and AIOTIC_API_KEY from .env or the environment
+    uploaded = client.orders.upload(["PO-4711.pdf"])  # one purchase order, one or more files
+    order = client.orders.wait(uploaded.request_id)   # polls until AIOTIC has processed it
+    print(order.status, order.request_id)
+```
+
+Next steps in the guide: [SDK overview](https://developers.aiotic.ai/sdk/overview),
+[bootstrapping a service](https://developers.aiotic.ai/sdk/bootstrapping),
+[client reference](https://developers.aiotic.ai/sdk/client).
 
 ## What is inside
 

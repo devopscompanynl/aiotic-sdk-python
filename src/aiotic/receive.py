@@ -108,6 +108,15 @@ class ErpReceiver:
     ``response`` is exactly what to send back to AIOTIC. Unexpected exceptions are converted to
     ``success: false`` with a generic message (the details go to your logs) so AIOTIC rolls back
     cleanly instead of timing out.
+
+    **Idempotency, and who guarantees what.** Deliveries with the same ``request_id`` are serialised
+    by one receiver instance: the second waits for the first and then answers with the stored result, so
+    one receiver never creates two orders for one id. Across instances or receivers, after a restart that lost
+    the store, or when the ERP accepted an order but the response was lost, the guarantee comes from the
+    ERP: ``create_sales_order`` must store the ``request_id`` as a unique external reference and return
+    the existing order when it already exists (see :class:`aiotic.erp.ports.ErpPort`). The receiver asks
+    ``find_order_by_request_id`` before every create, but only the ERP's uniqueness makes
+    "one ``request_id`` → at most one sales order" true everywhere.
     """
 
     def __init__(
@@ -130,9 +139,28 @@ class ErpReceiver:
         self.on_accepted = on_accepted
         self.on_rejected = on_rejected
         self.generic_error = generic_error
+        self._inflight: dict[str, list[Any]] = {}  # request_id → [lock, waiters]
+        self._inflight_guard = threading.Lock()
 
     def verify_key(self, provided: str | None) -> bool:
         return bool(provided) and hmac.compare_digest(provided.encode(), self.api_key.encode())
+
+    # One delivery per request_id at a time for this receiver instance. The entry disappears when nobody waits on it.
+    def _enter(self, rid: str) -> list[Any]:
+        with self._inflight_guard:
+            entry = self._inflight.get(rid)
+            if entry is None:
+                entry = self._inflight[rid] = [threading.Lock(), 0]
+            entry[1] += 1
+        entry[0].acquire()
+        return entry
+
+    def _leave(self, rid: str, entry: list[Any]) -> None:
+        entry[0].release()
+        with self._inflight_guard:
+            entry[1] -= 1
+            if entry[1] == 0:
+                self._inflight.pop(rid, None)
 
     def handle(self, body: dict[str, Any] | bytes | str, *, api_key_header: str | None) -> ReceiveOutcome:
         if not self.verify_key(api_key_header):
@@ -144,6 +172,13 @@ class ErpReceiver:
             return ReceiveOutcome(ErpReceiveResponse.rejected(f"Malformed payload: {exc.errors()[0]['msg']}"), None, None, http_status=400)
 
         rid = str(req.request_id)
+        entry = self._enter(rid)
+        try:
+            return self._process(req, rid)
+        finally:
+            self._leave(rid, entry)
+
+    def _process(self, req: ErpReceiveRequest, rid: str) -> ReceiveOutcome:
         # 1. Idempotency — same request id → same answer, no second booking.
         existing = self.store.get(rid) or (lambda r: r.order_number if r else None)(self.erp.find_order_by_request_id(rid))
         if existing:

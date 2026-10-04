@@ -22,8 +22,10 @@ from .errors import (
     AioticConflictError,
     AioticError,
     AioticErpRejectedError,
+    AioticIdentifierError,
     AioticNotFoundError,
     AioticServerError,
+    AioticTransportError,
     AioticUnavailableError,
     AioticValidationError,
 )
@@ -40,7 +42,9 @@ __all__ = [
     "AioticConflictError",
     "AioticValidationError",
     "AioticErpRejectedError",
+    "AioticIdentifierError",
     "AioticServerError",
+    "AioticTransportError",
     "AioticUnavailableError",
     "models",
 ]

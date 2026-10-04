@@ -170,7 +170,11 @@ class SyncReport:
 
 
 class SyncEngine:
-    """Applies :class:`ChangeEvent`s to AIOTIC, skipping records whose fingerprint did not change."""
+    """Applies :class:`ChangeEvent`s to AIOTIC, skipping records whose fingerprint did not change.
+
+    Events for the same record are always applied in the order given and never concurrently; different records
+    run in parallel. The report's counters are updated under a lock, so ``failed == 0`` is a reliable signal.
+    """
 
     ORDER = (ChangeKind.CUSTOMER, ChangeKind.PRODUCT, ChangeKind.MAPPING)  # FK order for upserts
 
@@ -179,39 +183,44 @@ class SyncEngine:
         self.state = state or InMemoryStateStore()
         self.concurrency = max(1, concurrency)
         self.dry_run = dry_run
+        self._report_lock = threading.Lock()
+
+    def _count(self, rep: SyncReport, field_name: str, error: str | None = None) -> None:
+        with self._report_lock:
+            setattr(rep, field_name, getattr(rep, field_name) + 1)
+            if error:
+                rep.errors.append(error)
 
     # -- single event ---------------------------------------------------------------------
     def apply(self, ev: ChangeEvent, *, report: SyncReport | None = None, force: bool = False) -> bool:
         """Apply one change. Returns True when a request was made (False when unchanged/skipped)."""
         rep = report or SyncReport()
         if ev.op == ChangeOp.UPSERT and not force and self.state.get(ev.state_key) == ev.fingerprint:
-            rep.skipped_unchanged += 1
+            self._count(rep, "skipped_unchanged")
             return False
         if self.dry_run:
             log.info("dry-run: %s %s %s", ev.op, ev.kind, ev.key)
-            rep.sent += 1
+            self._count(rep, "sent")
             return True
         try:
             if ev.op == ChangeOp.UPSERT:
                 self._upsert(ev)
                 self.state.set(ev.state_key, ev.fingerprint)
-                rep.sent += 1
+                self._count(rep, "sent")
             else:
                 self._delete(ev)
                 self.state.delete(ev.state_key)
-                rep.deleted += 1
+                self._count(rep, "deleted")
             return True
         except AioticNotFoundError:
             if ev.op == ChangeOp.DELETE:  # already gone — fine
                 self.state.delete(ev.state_key)
-                rep.deleted += 1
+                self._count(rep, "deleted")
                 return True
-            rep.failed += 1
-            rep.errors.append(f"{ev.kind} {ev.key}: referenced customer/product missing (upsert those first)")
+            self._count(rep, "failed", f"{ev.kind} {ev.key}: referenced customer/product missing (upsert those first)")
             return False
         except AioticError as exc:
-            rep.failed += 1
-            rep.errors.append(f"{ev.kind} {ev.key}: {exc}")
+            self._count(rep, "failed", f"{ev.kind} {ev.key}: {exc}")
             log.warning("sync failed for %s %s: %s", ev.kind, ev.key, exc)
             return False
 
@@ -232,17 +241,73 @@ class SyncEngine:
             self.client.customer_products.delete(ev.key[0], ev.key[1])
 
     # -- batches -------------------------------------------------------------------------
+    # The order in which independent events of one wave are sent: parents before children for upserts, children
+    # before parents for deletes. Dependent events never share a wave (see _plan).
+    PHASES = (
+        (ChangeOp.UPSERT, ChangeKind.CUSTOMER),
+        (ChangeOp.UPSERT, ChangeKind.PRODUCT),
+        (ChangeOp.UPSERT, ChangeKind.MAPPING),
+        (ChangeOp.DELETE, ChangeKind.MAPPING),
+        (ChangeOp.DELETE, ChangeKind.PRODUCT),
+        (ChangeOp.DELETE, ChangeKind.CUSTOMER),
+    )
+
+    @staticmethod
+    def _plan(events: list[ChangeEvent]) -> list[set[int]]:
+        """For every event of a batch, the earlier events it has to wait for.
+
+        * the previous event of the same record (events of one record run in the order given, never concurrently);
+        * for a mapping upsert: the latest earlier event of its customer and of its product, so parents exist first;
+        * for a customer or product delete: every earlier mapping event, so children go before parents.
+        All edges point backwards in the batch, so the plan is always a DAG and always makes progress.
+        """
+        deps: list[set[int]] = [set() for _ in events]
+        last_of_record: dict[str, int] = {}
+        mapping_events: list[int] = []
+        for i, ev in enumerate(events):
+            prev = last_of_record.get(ev.state_key)
+            if prev is not None:
+                deps[i].add(prev)
+            if ev.kind == ChangeKind.MAPPING:
+                if ev.op == ChangeOp.UPSERT:
+                    parents = (f"{ChangeKind.CUSTOMER}:{ev.key[0]}", f"{ChangeKind.PRODUCT}:{ev.data.get('item_number')}|{ev.data.get('language_code')}")
+                    deps[i].update(j for j in (last_of_record.get(k) for k in parents) if j is not None)
+                mapping_events.append(i)
+            elif ev.op == ChangeOp.DELETE:
+                deps[i].update(mapping_events)
+            last_of_record[ev.state_key] = i
+        return deps
+
+    def _run_batch(self, pool: ThreadPoolExecutor, events: Iterable[ChangeEvent], rep: SyncReport, *, force: bool = False) -> None:
+        """Run a batch in waves: an event runs once everything it depends on has run; within a wave the phases of
+        :data:`PHASES` go one after another and the events of one phase run in parallel."""
+        batch = list(events)
+        deps = self._plan(batch)
+        done: set[int] = set()
+        remaining = list(range(len(batch)))
+        while remaining:
+            ready = [i for i in remaining if deps[i] <= done]  # never empty: the earliest remaining event is ready
+            for op, kind in self.PHASES:
+                wave = [i for i in ready if batch[i].op == op and batch[i].kind == kind]
+                if wave:
+                    list(pool.map(lambda i: self.apply(batch[i], report=rep, force=force), wave))
+                    done.update(wave)
+            remaining = [i for i in remaining if i not in done]
+
     def apply_many(self, events: Iterable[ChangeEvent], *, force: bool = False) -> SyncReport:
-        """Apply a batch: upserts in FK order (customers → products → mappings), deletes in reverse, in parallel per kind."""
+        """Apply a batch.
+
+        Events for the same record are applied one after another, in the order given, never concurrently, so
+        ``delete C1`` followed by ``upsert C1`` ends with C1 present and ``upsert v1``, ``upsert v2`` ends with v2.
+        Dependencies between records are kept as well: a mapping is created after the customer and the product it
+        refers to, and a customer or product is deleted after the mappings that came before it in the batch. A batch
+        that creates and then removes a customer, a product and their mapping therefore succeeds in source order.
+        Independent events run in parallel, parents before children for upserts and children before parents for
+        deletes.
+        """
         rep = SyncReport()
-        evs = list(events)
-        upserts = [e for e in evs if e.op == ChangeOp.UPSERT]
-        deletes = [e for e in evs if e.op == ChangeOp.DELETE]
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            for kind in self.ORDER:
-                list(pool.map(lambda e: self.apply(e, report=rep, force=force), [e for e in upserts if e.kind == kind]))
-            for kind in reversed(self.ORDER):
-                list(pool.map(lambda e: self.apply(e, report=rep), [e for e in deletes if e.kind == kind]))
+            self._run_batch(pool, events, rep, force=force)
         log.info("sync batch: %s", rep)
         return rep
 
@@ -254,22 +319,29 @@ class SyncEngine:
         products: Iterable[ChangeEvent] | None = None,
         mappings: Iterable[ChangeEvent] | None = None,
         delete_missing: bool = True,
+        allow_empty: bool = False,
     ) -> SyncReport:
         """Safety net: given the *complete* current data set as upsert events, send only what changed
-        and delete what disappeared (compared with the fingerprints remembered from earlier runs)."""
+        and delete what disappeared (compared with the fingerprints remembered from earlier runs).
+
+        An **empty** data set for a kind that has records in the state store is treated as a broken export,
+        not as "delete everything": nothing is deleted, the report gets one failure that says so. Pass
+        ``allow_empty=True`` (CLI: ``--allow-empty``) when the data set really is empty and the deletions
+        are intended.
+        """
         rep = SyncReport()
         for kind, source in ((ChangeKind.CUSTOMER, customers), (ChangeKind.PRODUCT, products), (ChangeKind.MAPPING, mappings)):
             if source is None:
                 continue
-            present: set[str] = set()
-            batch: list[ChangeEvent] = []
-            for ev in source:
-                present.add(ev.state_key)
-                batch.append(ev)
+            batch = list(source)
+            present = {ev.state_key for ev in batch if ev.op == ChangeOp.UPSERT}
             with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-                list(pool.map(lambda e: self.apply(e, report=rep), batch))
+                self._run_batch(pool, batch, rep)
             if delete_missing:
                 gone = [k for k in self.state.keys(f"{kind}:") if k not in present]
+                if gone and not present and not allow_empty:
+                    self._count(rep, "failed", f"{kind}: the data set is empty but {len(gone)} record(s) were sent earlier; refusing to delete them (pass allow_empty=True / --allow-empty when the data set really is empty)")
+                    continue
                 for k in gone:
                     parts = tuple(k.split(":", 1)[1].split("|"))
                     self.apply(ChangeEvent(kind, ChangeOp.DELETE, parts), report=rep)
@@ -277,13 +349,21 @@ class SyncEngine:
         return rep
 
     def bootstrap_state_from_aiotic(self) -> int:
-        """Seed the state store from what AIOTIC already holds, so the first reconcile does not re-send everything."""
+        """Seed the state store from what AIOTIC already holds, so the first reconcile does not re-send everything.
+
+        Products without a description (AIOTIC may return them, an upsert cannot write them) are not seeded:
+        the next reconcile sends them once with your description, which is the right outcome.
+        """
         n = 0
+        skipped = 0
         for c in self.client.customers.iter_all():
             ev = ChangeEvent.customer_upsert(c.number, **c.model_dump(include=set(CustomerUpsert.model_fields) - {"id"}, exclude_none=True))
             self.state.set(ev.state_key, ev.fingerprint)
             n += 1
         for p in self.client.products.iter_all():
+            if p.description is None:
+                skipped += 1
+                continue
             ev = ChangeEvent.product_upsert(p.item_number, p.language_code, description=p.description, remark=p.remark)
             self.state.set(ev.state_key, ev.fingerprint)
             n += 1
@@ -291,6 +371,8 @@ class SyncEngine:
             ev = ChangeEvent.mapping_upsert(cp.customer_number, cp.customer_item_number, item_number=cp.item_number, language_code=cp.language_code)
             self.state.set(ev.state_key, ev.fingerprint)
             n += 1
+        if skipped:
+            log.warning("bootstrap: %d product(s) in AIOTIC have no description and were not seeded", skipped)
         return n
 
 

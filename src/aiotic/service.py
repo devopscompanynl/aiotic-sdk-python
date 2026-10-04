@@ -4,10 +4,14 @@
     app = build_app()          # reads AIOTIC_* env vars; uses the demo in-memory ERP unless you pass one
 
 Endpoints:
-  POST /aiotic/orders       ERP receive endpoint (AIOTIC → you)
+  POST /aiotic/orders       ERP receive endpoint (AIOTIC → you); needs AIOTIC_ERP_RECEIVE_KEY, the app refuses to start without it
   POST /aiotic/processing   processing webhook   (AIOTIC → you), when AIOTIC_WEBHOOK_KEY is set
-  POST /erp/events          change events        (your ERP → you) → sync engine
+  POST /erp/events          change events        (your ERP → you) → sync engine, only when a ``sync_engine`` is passed;
+                            protected by AIOTIC_ERP_EVENTS_KEY (falls back to the receive key)
   GET  /healthz
+
+Every endpoint that writes somewhere requires a configured secret. There is no placeholder key and no unauthenticated
+mode: a missing key is a configuration error, never an open endpoint.
 """
 
 from __future__ import annotations
@@ -49,16 +53,25 @@ def build_app(
     store: IdempotencyStore | None = None,
     receive_path: str = "/aiotic/orders",
     sync_engine: Any | None = None,
+    erp_events_key: str | None = None,
 ) -> Any:
-    """Build the FastAPI app. Requires the ``server`` extra (``pip install "aiotic-sdk[server]"``)."""
+    """Build the FastAPI app. Requires the ``server`` extra (``pip install "aiotic-sdk[server]"``).
+
+    Raises ``ValueError`` when ``AIOTIC_ERP_RECEIVE_KEY`` is missing: the receive endpoint is never exposed without
+    the key AIOTIC authenticates with. ``POST /erp/events`` exists only when a ``sync_engine`` is passed and is
+    protected by ``erp_events_key`` (argument, then ``AIOTIC_ERP_EVENTS_KEY``, then the receive key).
+    """
     from fastapi import FastAPI
 
     s = settings or Settings.from_env()
+    if not s.erp_receive_key:
+        raise ValueError(
+            "AIOTIC_ERP_RECEIVE_KEY is not set. It is the key AIOTIC sends in X-API-KEY to your receive endpoint; "
+            "the service does not start without it. Run `aiotic init` or set the variable."
+        )
     erp = erp or InMemoryErp()
     store = store or SqliteStore()
-    receiver = ErpReceiver(erp, api_key=s.erp_receive_key or "change-me", pipeline=pipeline or default_pipeline(erp, store), store=store)
-    if not s.erp_receive_key:
-        log.warning("AIOTIC_ERP_RECEIVE_KEY is not set — the receive endpoint uses the placeholder key 'change-me'")
+    receiver = ErpReceiver(erp, api_key=s.erp_receive_key, pipeline=pipeline or default_pipeline(erp, store), store=store)
 
     app = FastAPI(title="AIOTIC integration service", version="0.1.0", docs_url="/docs")
     app.include_router(create_receive_router(receiver, path=receive_path))
@@ -67,13 +80,19 @@ def build_app(
     if s.webhook_key:
         processing = ProcessingWebhookReceiver(s.webhook_key, lambda req: log.info("processing webhook: %s %s", req.request_id, req.purchase_order.order_number))
 
-    def on_change_events(events: list[Any]) -> Any:
-        if sync_engine is None:
-            log.warning("received %d change events but no sync engine is configured", len(events))
-            return None
-        return sync_engine.apply_many(events)
+    on_change_events = None
+    if sync_engine is not None:
 
-    app.include_router(create_webhook_routers(processing=processing, on_change_events=on_change_events, erp_events_key=s.erp_receive_key))
+        def on_change_events(events: list[Any]) -> Any:
+            return sync_engine.apply_many(events)
+
+    app.include_router(
+        create_webhook_routers(
+            processing=processing,
+            on_change_events=on_change_events,
+            erp_events_key=(erp_events_key or s.erp_events_key or s.erp_receive_key) if on_change_events else None,
+        )
+    )
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

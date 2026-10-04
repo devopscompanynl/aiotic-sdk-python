@@ -4,6 +4,13 @@ Copy this file, rename the class, and replace the three ``_map_*`` methods and t
 with your ERP's endpoints. Keep the contract: return :class:`ErpCreateResult`, raise
 :class:`ErpRejected` for business refusals (the text goes back to the operator), let other
 exceptions propagate (they become a generic failure and AIOTIC rolls the status back).
+
+**Required ERP capability.** The external reference (``externalReference`` below) must be unique in
+the ERP: a second create with the same value has to fail, which this template expects as HTTP 409.
+The adapter then looks the order up and returns it with ``created=False``, so two deliveries of the
+same ``request_id`` — even to different service instances — end in one sales order. If your ERP does
+not enforce that uniqueness, add it (a unique index or a duplicate check inside one transaction)
+before relying on this adapter; nothing on the client side can replace it.
 """
 
 from __future__ import annotations
@@ -52,15 +59,24 @@ class FunctionalApiAdapter:
             return ErpCreateResult(order_number=str(rows[0]["number"]), created=False)
         return None
 
+    @staticmethod
+    def _error_message(r: httpx.Response) -> str:
+        try:
+            return (r.json().get("error", {}).get("message") or r.text)[:500]
+        except (ValueError, AttributeError):
+            return r.text[:500]
+
     def create_sales_order(self, request_id: str, order: ErpPurchaseOrder) -> ErpCreateResult:
         r = self._http.post("/salesOrders", json=self._map_header(request_id, order))
-        if r.status_code in (400, 409, 422):
+        if r.status_code == 409:
+            # The ERP refused a duplicate external reference: another delivery of this request_id won. Answer with it.
+            existing = self.find_order_by_request_id(request_id)
+            if existing:
+                return existing
+            raise ErpRejected(self._error_message(r))
+        if r.status_code in (400, 422):
             # Functional ERPs return a business reason — pass it on to the operator verbatim.
-            try:
-                message = r.json().get("error", {}).get("message") or r.text
-            except ValueError:
-                message = r.text
-            raise ErpRejected(message[:500])
+            raise ErpRejected(self._error_message(r))
         r.raise_for_status()
         body = r.json()
         return ErpCreateResult(order_number=str(body["number"]), created=True, details=body)

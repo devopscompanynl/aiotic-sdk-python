@@ -11,6 +11,7 @@ Environment variables (all prefixed ``AIOTIC_``):
 ``AIOTIC_RATE_LIMIT``   Max requests per second the client will issue (default 10; 0 = unlimited)
 ``AIOTIC_ERP_RECEIVE_KEY``  The key AIOTIC sends in ``X-API-KEY`` to *your* receive endpoint
 ``AIOTIC_WEBHOOK_KEY``  The key AIOTIC sends in ``X-API-KEY`` to your processing webhook
+``AIOTIC_ERP_EVENTS_KEY``  The key *your ERP* sends in ``X-API-KEY`` to ``POST /erp/events`` (defaults to the receive key)
 ======================  ====================================================================
 """
 
@@ -49,6 +50,7 @@ class Settings:
     rate_limit: float = 10.0
     erp_receive_key: str | None = None
     webhook_key: str | None = None
+    erp_events_key: str | None = None
     user_agent: str = field(default="aiotic-sdk-python")
 
     @classmethod
@@ -71,6 +73,7 @@ class Settings:
             rate_limit=float(get("RATE_LIMIT", "10") or 10),
             erp_receive_key=get("ERP_RECEIVE_KEY") or None,
             webhook_key=get("WEBHOOK_KEY") or None,
+            erp_events_key=get("ERP_EVENTS_KEY") or None,
         )
 
     def require(self) -> "Settings":

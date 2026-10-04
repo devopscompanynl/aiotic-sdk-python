@@ -72,7 +72,11 @@ class DataApiAdapter:
             return ErpCreateResult(order_number=row[0], created=False) if row else None
 
     def create_sales_order(self, request_id: str, o: ErpPurchaseOrder) -> ErpCreateResult:
-        """Header + lines in ONE transaction, keyed on the AIOTIC request id for idempotency."""
+        """Header + lines in ONE transaction, keyed on the AIOTIC request id for idempotency.
+
+        ``external_ref`` is UNIQUE in the schema; when two deliveries race, the second insert fails with the
+        driver's ``IntegrityError`` and this method answers with the order the first one created.
+        """
         conn = self.connect()
         try:
             cur = conn.cursor()
@@ -94,8 +98,12 @@ class DataApiAdapter:
                 cur.execute(self._q(self.SQL["insert_line"]), (order_no, n, item.article_number, item.description, item.quantity, item.unit, item.price))
             conn.commit()
             return ErpCreateResult(order_number=order_no, created=True)
-        except Exception:
+        except Exception as exc:
             conn.rollback()
+            if type(exc).__name__ == "IntegrityError":  # DB-API drivers all name it so; the module differs per driver
+                existing = self.find_order_by_request_id(request_id)
+                if existing:
+                    return existing
             raise
         finally:
             conn.close()
