@@ -8,8 +8,8 @@
    an outbox worker or a message queue consumer to the same code path::
 
        {"events": [
-         {"kind": "product", "op": "upsert", "item_number": "620206_01", "language_code": "nl", "description": "…"},
-         {"kind": "customer", "op": "delete", "number": "10577"}
+         {"kind": "product", "op": "upsert", "item_number": "CBL-3015", "language_code": "nl", "description": "…"},
+         {"kind": "customer", "op": "delete", "number": "40112"}
        ]}
 
 3. :func:`verify_hmac_signature` is provided for the *proposed* signed event webhooks
@@ -66,10 +66,10 @@ def parse_change_events(payload: dict[str, Any]) -> list[ChangeEvent]:
             out.append(ChangeEvent.customer_delete(number) if op == ChangeOp.DELETE else ChangeEvent.customer_upsert(number, **{k: v for k, v in raw.items() if k not in {"kind", "op", "number"}}))
         elif kind == ChangeKind.PRODUCT:
             item, lang = str(raw["item_number"]), str(raw.get("language_code", "nl"))
-            out.append(ChangeEvent.product_delete(item, lang) if op == ChangeOp.DELETE else ChangeEvent.product_upsert(item, lang, description=raw["description"], remark=raw.get("remark")))
+            out.append(ChangeEvent.product_delete(item, lang) if op == ChangeOp.DELETE else ChangeEvent.product_upsert(item, lang, description=raw["description"], remark=raw.get("remark"), source_updated_at=raw.get("source_updated_at")))
         else:
             cn, cin = str(raw["customer_number"]), str(raw["customer_item_number"])
-            out.append(ChangeEvent.mapping_delete(cn, cin) if op == ChangeOp.DELETE else ChangeEvent.mapping_upsert(cn, cin, item_number=str(raw["item_number"]), language_code=str(raw.get("language_code", "nl"))))
+            out.append(ChangeEvent.mapping_delete(cn, cin) if op == ChangeOp.DELETE else ChangeEvent.mapping_upsert(cn, cin, item_number=str(raw["item_number"]), language_code=str(raw.get("language_code", "nl")), source_updated_at=raw.get("source_updated_at")))
     return out
 
 

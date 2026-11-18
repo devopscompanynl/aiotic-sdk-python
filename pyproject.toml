@@ -5,7 +5,7 @@ description = "AIOTIC integration SDK: typed API client, ERP receive endpoint, v
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "DevOps Company", email = "info@devopscompany.nl" }]
+authors = [{ name = "DevOps Company", email = "dev@aiotic.ai" }]
 keywords = ["aiotic", "erp", "integration", "purchase-order", "sdk"]
 classifiers = [
   "Development Status :: 4 - Beta",

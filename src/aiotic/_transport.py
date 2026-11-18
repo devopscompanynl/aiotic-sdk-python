@@ -4,17 +4,21 @@ client-side rate limiting and error mapping."""
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import random
 import threading
 import time
+from collections.abc import Iterable
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
 from ._version import __version__
 from .config import Settings
-from .errors import AioticIdentifierError, AioticTransportError, error_for_status
+from .errors import AioticError, AioticIdentifierError, AioticOutcomeUnknownError, AioticTransportError, error_for_status
 
 RETRY_STATUSES = frozenset({408, 425, 429, 502, 503, 504})
 # With these statuses the server did not process the request, so even a request that is not idempotent can be sent
@@ -26,10 +30,17 @@ NOT_PROCESSED_STATUSES = frozenset({408, 425, 429})
 NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 IDEMPOTENT_METHODS = frozenset({"GET", "HEAD", "PUT", "DELETE"})
 SYNC_KEY_PREFIXES = ("/customer/", "/product/", "/customer-product/")
+# Answers an intermediary can give after the backend already accepted the request: the outcome is unknown.
+AMBIGUOUS_STATUSES = frozenset({502, 503, 504})
+# The one sort the list endpoints of the master data offer: newest source change first, records without one last.
+NEWEST_SOURCE_CHANGE = "-source_updated_at"
+# The parts of the e-mail an order came from, as ``orders.email()`` names them.
+EMAIL_SOURCES = ("raw_email", "email_body")
 
 
 class TokenBucket:
-    """Simple token bucket so a sync job never floods the tenant (the API has no server-side limit)."""
+    """Simple token bucket so a sync job keeps a steady pace. AIOTIC can rate-limit requests per client IP address
+    and refuse the ones above the limit, with a 503; staying below it is cheaper than backing off."""
 
     def __init__(self, rate_per_sec: float, burst: int | None = None):
         self.rate = rate_per_sec
@@ -109,7 +120,8 @@ def should_retry(response: httpx.Response, method: str, *, idempotent: bool = Tr
     """
     if response.status_code not in RETRY_STATUSES:
         return False
-    # Never blindly retry an ERP send on 503 (integration not configured) — surface it.
+    # Never blindly retry an ERP send on 503 (integration not configured, or a refusal by a gateway such as the
+    # rate limit: the status does not say which) — surface it.
     if method == "POST" and response.request.url.path.startswith("/erp/send") and response.status_code == 503:
         return False
     return idempotent or response.status_code in NOT_PROCESSED_STATUSES
@@ -121,18 +133,95 @@ def replay_allowed(exc: Exception, *, idempotent: bool) -> bool:
     return idempotent or isinstance(exc, NOT_SENT_ERRORS)
 
 
-def path_segment(value: Any, *, what: str = "identifier") -> str:
+def path_segment(value: Any, *, what: str = "identifier", allow_slash: bool = False) -> str:
     """Encode one value as a single URL path segment (``#``, ``?``, ``%``, spaces and non-ASCII are percent-encoded).
 
     Values that cannot travel as one segment are refused before any request: empty strings, the dot segments
     ``.`` and ``..``, and anything containing a slash, a backslash or a control character. Servers decode and
     normalise those differently, so encoding them could address another record.
+
+    ``allow_slash`` is for the two identifiers the API accepts with a slash, a product's item number and a
+    customer's own item number: ``LED 48/100 W`` travels as ``LED%2048%2F100%20W``. The parts between the
+    slashes still may not be empty or a dot segment, so the value cannot start or end with a slash or hold two in
+    a row.
     """
     text = str(value)
-    if not text or text in (".", "..") or "/" in text or "\\" in text or any(ord(ch) < 32 or ch == "\x7f" for ch in text):
+    parts = text.split("/") if allow_slash else [text]
+    bad_part = any(part in ("", ".", "..") for part in parts)
+    if bad_part or (not allow_slash and "/" in text) or "\\" in text or any(ord(ch) < 32 or ch == "\x7f" for ch in text):
         raise AioticIdentifierError(f"{what} {text!r} cannot be sent as a URL path segment")
     return quote(text, safe="")
 
 
 def transport_error(exc: Exception, path: str) -> AioticTransportError:
     return AioticTransportError(f"{path}: {exc.__class__.__name__}: {exc}", detail=str(exc))
+
+
+def email_source(source: str) -> str:
+    """Check the ``source`` of ``orders.email()`` before it becomes part of a URL."""
+    if source not in EMAIL_SOURCES:
+        raise ValueError(f"source must be one of {', '.join(EMAIL_SOURCES)}, not {source!r}")
+    return source
+
+
+def outcome_unknown(exc: AioticError) -> bool:
+    """Whether a failed request may nevertheless have been carried out: a transport failure after the request
+    was sent, or an answer an intermediary gives when the connection to the backend broke."""
+    if exc.earlier_attempt_unanswered:
+        return True  # the last attempt may have sent nothing, but an earlier one did and nobody answered it
+    if isinstance(exc, AioticTransportError):
+        return not isinstance(exc.__cause__, NOT_SENT_ERRORS)  # a connection that never opened sent nothing
+    return exc.status in AMBIGUOUS_STATUSES
+
+
+def unanswered_attempt(failure: Exception | httpx.Response) -> bool:
+    """Whether an attempt that is about to be repeated may have been carried out: it was sent and the connection
+    broke, or an intermediary answered for a backend it lost."""
+    if isinstance(failure, httpx.Response):
+        return failure.status_code in AMBIGUOUS_STATUSES
+    return not isinstance(failure, NOT_SENT_ERRORS)
+
+
+def upload_outcome_unknown(request_id: str, waited: float, cause: AioticError) -> AioticOutcomeUnknownError:
+    return AioticOutcomeUnknownError(
+        f"/order/upload: no answer for request_id {request_id}, and the order did not appear within {waited:g}s. "
+        "The upload may still arrive: look it up with orders.get() before you upload again. Uploading again under "
+        "the same request_id puts that order back into QUEUED and processes it again",
+        status=cause.status,
+        detail=cause.detail,
+        request_id=request_id,
+    )
+
+
+def bulk_outcome_unknown(path: str, cause: AioticError) -> AioticOutcomeUnknownError:
+    return AioticOutcomeUnknownError(
+        f"{path}: an attempt was sent and nobody answered it. AIOTIC finishes a bulk sync it has started, so the data set may "
+        "already be replaced: send the same, current data set again later to see the result. Do not send an older one",
+        status=cause.status,
+        detail=cause.detail,
+    )
+
+
+def bulk_body(rows: Iterable[Any], model: type[BaseModel], *, compress: bool = True) -> tuple[bytes, dict[str, str]]:
+    """Validate the rows of a bulk sync against ``model`` and serialise them as one JSON array, gzip-compressed
+    unless ``compress`` is off. Returns the body and the headers that describe it.
+
+    A row the API would refuse is refused here, before anything is sent, with its position in the data set.
+    """
+    out: list[dict[str, Any]] = []
+    for position, row in enumerate(rows):
+        try:
+            validated = row if isinstance(row, model) else model.model_validate(row.model_dump() if isinstance(row, BaseModel) else row)
+        except ValidationError as exc:
+            first = exc.errors()[0]
+            field = ".".join(str(part) for part in first["loc"]) or "row"
+            raise ValueError(f"bulk sync row {position}: {field}: {first['msg']}") from exc
+        out.append(validated.model_dump(mode="json", exclude_none=True))
+    if not out:
+        raise ValueError("a bulk sync needs at least one row: it replaces the whole data set, and AIOTIC refuses an empty one")
+    data = json.dumps(out, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if compress:
+        data = gzip.compress(data, compresslevel=6)
+        headers["Content-Encoding"] = "gzip"
+    return data, headers

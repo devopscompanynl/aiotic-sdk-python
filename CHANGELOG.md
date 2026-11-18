@@ -6,6 +6,69 @@ Dates are release dates. The full documentation is at <https://developers.aiotic
 
 ## Unreleased
 
+## 0.2.0 — 2026-11-18
+
+### Added
+
+- **Bulk sync.** `customers.bulk_sync(rows)`, `products.bulk_sync(rows)` and `customer_products.bulk_sync(rows)` send
+  a data set's complete content in one gzip-compressed call (`POST /customer/bulk`, `/product/bulk`,
+  `/customer-product/bulk`), on both clients. AIOTIC stores the rows and removes every record the call does not
+  contain; the result carries `inserted`, `updated`, `unchanged`, `deleted` and, per data set, `mappings_deleted` or
+  `skipped_total` with the skipped rows. The timeout is `Settings.bulk_timeout` (`AIOTIC_BULK_TIMEOUT`, 120 s). When
+  an attempt ends without an answer the same body is sent again and `result.attempts` says so; when an attempt went
+  unanswered and no later attempt brought a result, `AioticOutcomeUnknownError` is raised, also when that later
+  attempt could not connect or was refused.
+- **A safeguard for bulk sync.** `SyncEngine.bulk_sync(customers=…, products=…, mappings=…)` compares each data set
+  with what AIOTIC holds before anything is sent, and raises `BulkSyncRefused` when more than 10 % of the held
+  records would be removed (`max_delete_fraction`) or when a mapping points at a customer or product that AIOTIC
+  will not hold. A mapping that AIOTIC would remove because its row is skipped counts as removed, so approving
+  skipped rows never approves a large removal. Nothing is sent unless every data set passes.
+  `approve_deletions=True` and `approve_skipped=True` are the explicit overrides; `dry_run=True` on the engine
+  only reports. The checks are the SDK's: the API itself only refuses an empty data set. CLI: `aiotic sync bulk --customers … --products … --mappings …`, exit code 2 when
+  refused. A bulk file is sent as it is: products and mappings need the `language_code` column (no default), a
+  record whose key value is blank or not text stops the run, and `created_at` is passed on.
+- **`source_updated_at`** on customers, products and mappings: when your ERP last changed the record. It needs a zone
+  or offset and is returned in UTC. The list methods take `sort="-source_updated_at"`, and
+  `latest_source_update()` returns the newest moment AIOTIC holds. `ChangeEvent.product_upsert` and
+  `mapping_upsert` accept it; `customer_upsert` takes it as a field.
+- **`CursorChangeSource`**: an incremental sync that continues from the newest `source_updated_at` in AIOTIC instead
+  of a locally stored watermark. It sends changes oldest first, stops at the first one that fails and restarts at or
+  before the cursor, so a failed change is never skipped. `SyncEngine.apply_in_order()` is the building block.
+- **An order's files and e-mail**: `orders.files(request_id)` lists them with what each one is (`OrderFile.source`),
+  `orders.email(request_id, "raw_email" | "email_body")` downloads the e-mail an order came from.
+- **Temporary refusals from your receive endpoint**: `ErpReceiveResponse.rejected(error, retryable=True)` and the
+  adapter exception `ErpTemporaryRefusal` answer `"retryable": true`, which makes AIOTIC send the same order again.
+  Use them only when a repeat cannot create the order twice.
+
+### Changed
+
+- **`orders.upload()` no longer repeats an upload whose outcome is unknown.** AIOTIC processes an upload again when
+  it arrives a second time under the same `request_id`, and puts that order back into `QUEUED` whatever its status
+  was, so the id is not an idempotency key. After a lost response, a 502, 503 or 504 the client now looks the
+  `request_id` up for `confirm_timeout` seconds (30 by default): it returns normally when the order appears and
+  raises `AioticOutcomeUnknownError` with the `request_id` otherwise. `resend_if_missing=True` uploads once more at
+  that point. An upload that provably did not arrive is still sent again.
+- **A customer needs a name.** `CustomerUpsert.name` is required and may not be blank, as the API now requires;
+  `ChangeEvent.customer_upsert` and `aiotic sync customers` refuse a record without one before any request.
+  `Customer` (what the API returns) keeps an optional name for records stored earlier.
+- **A blank or malformed key in a sync file is an error.** `aiotic sync customers | products | mappings | reconcile`
+  stop on a record whose customer number, item number or customer item number is blank, instead of sending it
+  under the text `None`, and on one that is a list, an object, true/false or a decimal number in a JSON file. A
+  whole number is still read as text.
+- **A slash is allowed in item numbers.** A product's item number and a customer's own item number may contain `/`
+  and travel as `%2F`; a value that starts or ends with a slash or holds two in a row is still refused. Customer
+  numbers, language codes and file names remain one path segment.
+- `PurchaseOrder.order_date` may be `None`. AIOTIC fills in the date the e-mail was received when the document shows
+  no order date, so this is rare, but the API allows it.
+- `Customer` and `CustomerProduct` no longer inherit from their `…Upsert` models; the fields are the same.
+- HTTP 413 raises `AioticValidationError`.
+- The mock tenant follows the API in all of the above: bulk sync, sorting, `source_updated_at`, the refusals (422 for
+  a customer without a name, 409 for a taken `id`, 404 naming the missing customer or product), deleting a customer
+  or product removes its mappings, an upload under an existing `request_id` is processed again, and `/erp/send`
+  accepts an answer without a boolean `success` only with a 2xx status and repeats a refusal marked retryable.
+  `direct_upload=False` makes both upload endpoints answer 409.
+- The author contact in the package metadata is `dev@aiotic.ai`.
+
 ## 0.1.2 — 2026-10-04
 
 ### Fixed

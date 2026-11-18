@@ -8,6 +8,6 @@
 :class:`aiotic.erp.memory.InMemoryErp` is a complete fake used by the tests and the quick start.
 """
 
-from .ports import CatalogPort, CustomerPort, ErpCreateResult, ErpPort
+from .ports import CatalogPort, CustomerPort, ErpCreateResult, ErpPort, ErpRejected, ErpTemporaryRefusal
 
-__all__ = ["ErpPort", "CatalogPort", "CustomerPort", "ErpCreateResult"]
+__all__ = ["ErpPort", "CatalogPort", "CustomerPort", "ErpCreateResult", "ErpRejected", "ErpTemporaryRefusal"]

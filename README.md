@@ -56,7 +56,7 @@ Next steps in the guide: [SDK overview](https://developers.aiotic.ai/sdk/overvie
 | `aiotic.receive` | The ERP receive endpoint: API-key check, idempotency, pipeline, correct `{success, …}` response |
 | `aiotic.pipeline` | Sanitizers → validators → business rules — the validation layer for ERPs with only a data API |
 | `aiotic.erp` | `ErpPort` + templates: `FunctionalApiAdapter`, `DataApiAdapter`, `InMemoryErp` |
-| `aiotic.sync` | Event-driven master-data sync with hash-based reconciliation (never a full re-upload) |
+| `aiotic.sync` | Master-data sync: event-driven with hash-based reconciliation, or one bulk sync per data set with a check on what it would remove |
 | `aiotic.watch` | `OrderWatcher`: polls order status and emits transitions |
 | `aiotic.webhooks` | Receivers for AIOTIC's processing webhook and your ERP's change events |
 | `aiotic.service` | `build_app()` — a complete integration service in one call |

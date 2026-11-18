@@ -19,7 +19,7 @@ class InMemoryErp:
         blocked: set[str] | None = None,
         prefix: str = "SO-",
     ):
-        self.products: set[str] = set(products or {"PROD-001", "PROD-002", "620206_01"})
+        self.products: set[str] = set(products or {"PROD-001", "PROD-002", "CBL-3015"})
         self.customers: dict[str, dict[str, Any]] = customers or {"58931": {"name": "LUMITECH INSTALLATIES", "city": "Apeldoorn"}}
         self.blocked: set[str] = set(blocked or ())
         self.orders: dict[str, dict[str, Any]] = {}

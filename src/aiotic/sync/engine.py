@@ -9,13 +9,16 @@ import time
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from ..client import AioticClient
 from ..errors import AioticError, AioticNotFoundError
 from ..models import CustomerProductUpsert, CustomerUpsert, ProductUpsert
+
+if TYPE_CHECKING:
+    from .bulk import BulkSyncReport
 
 log = logging.getLogger("aiotic.sync")
 
@@ -31,9 +34,23 @@ class ChangeOp(StrEnum):
     DELETE = "delete"
 
 
+def _upsert_data(model: Any) -> dict[str, Any]:
+    """The body of an upsert. ``source_updated_at`` is written in UTC, so that the same moment always gives the
+    same body and the same fingerprint, whatever offset your ERP reported it in."""
+    data = model.model_dump(exclude_none=True, mode="json")
+    if model.source_updated_at is not None:
+        data["source_updated_at"] = model.source_updated_at.astimezone(timezone.utc).isoformat()
+    return data
+
+
 @dataclass(slots=True, frozen=True)
 class ChangeEvent:
-    """One change in your ERP, in AIOTIC terms. ``key`` is the AIOTIC identity of the record."""
+    """One change in your ERP, in AIOTIC terms. ``key`` is the AIOTIC identity of the record.
+
+    An upsert may carry ``source_updated_at``: when your ERP last changed the record, as a ``datetime`` with a
+    zone or an RFC 3339 string with one. AIOTIC stores it, and an incremental sync continues from the newest one
+    (:class:`CursorChangeSource`). An upsert without it clears the value AIOTIC held.
+    """
 
     kind: ChangeKind
     op: ChangeOp
@@ -43,23 +60,24 @@ class ChangeEvent:
     # -- constructors -------------------------------------------------------------------
     @classmethod
     def customer_upsert(cls, number: str, **fields: Any) -> "ChangeEvent":
-        return cls(ChangeKind.CUSTOMER, ChangeOp.UPSERT, (number,), CustomerUpsert(**fields).model_dump(exclude_none=True, mode="json"))
+        """``name`` is required, as the API requires it; every other field of ``CustomerUpsert`` is optional."""
+        return cls(ChangeKind.CUSTOMER, ChangeOp.UPSERT, (number,), _upsert_data(CustomerUpsert(**fields)))
 
     @classmethod
     def customer_delete(cls, number: str) -> "ChangeEvent":
         return cls(ChangeKind.CUSTOMER, ChangeOp.DELETE, (number,))
 
     @classmethod
-    def product_upsert(cls, item_number: str, language_code: str, *, description: str, remark: str | None = None) -> "ChangeEvent":
-        return cls(ChangeKind.PRODUCT, ChangeOp.UPSERT, (item_number, language_code), ProductUpsert(description=description, remark=remark).model_dump(exclude_none=True))
+    def product_upsert(cls, item_number: str, language_code: str, *, description: str, remark: str | None = None, source_updated_at: datetime | str | None = None) -> "ChangeEvent":
+        return cls(ChangeKind.PRODUCT, ChangeOp.UPSERT, (item_number, language_code), _upsert_data(ProductUpsert(description=description, remark=remark, source_updated_at=source_updated_at)))
 
     @classmethod
     def product_delete(cls, item_number: str, language_code: str) -> "ChangeEvent":
         return cls(ChangeKind.PRODUCT, ChangeOp.DELETE, (item_number, language_code))
 
     @classmethod
-    def mapping_upsert(cls, customer_number: str, customer_item_number: str, *, item_number: str, language_code: str) -> "ChangeEvent":
-        return cls(ChangeKind.MAPPING, ChangeOp.UPSERT, (customer_number, customer_item_number), CustomerProductUpsert(item_number=item_number, language_code=language_code).model_dump())
+    def mapping_upsert(cls, customer_number: str, customer_item_number: str, *, item_number: str, language_code: str, source_updated_at: datetime | str | None = None) -> "ChangeEvent":
+        return cls(ChangeKind.MAPPING, ChangeOp.UPSERT, (customer_number, customer_item_number), _upsert_data(CustomerProductUpsert(item_number=item_number, language_code=language_code, source_updated_at=source_updated_at)))
 
     @classmethod
     def mapping_delete(cls, customer_number: str, customer_item_number: str) -> "ChangeEvent":
@@ -73,6 +91,12 @@ class ChangeEvent:
     @property
     def fingerprint(self) -> str:
         return hashlib.sha256(json.dumps(self.data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:24]
+
+    @property
+    def source_updated_at(self) -> datetime | None:
+        """The ``source_updated_at`` this upsert carries, in UTC; ``None`` for a delete or an upsert without one."""
+        value = self.data.get("source_updated_at")
+        return datetime.fromisoformat(value) if value else None
 
 
 class StateStore(Protocol):
@@ -160,13 +184,15 @@ class SyncReport:
     failed: int = 0
     errors: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.time)
+    not_attempted: int = 0  # events left alone because an earlier one failed (``apply_in_order`` only)
 
     @property
     def duration(self) -> float:
         return time.time() - self.started_at
 
     def __str__(self) -> str:
-        return f"sent={self.sent} deleted={self.deleted} unchanged={self.skipped_unchanged} failed={self.failed} in {self.duration:.1f}s"
+        left = f" not_attempted={self.not_attempted}" if self.not_attempted else ""
+        return f"sent={self.sent} deleted={self.deleted} unchanged={self.skipped_unchanged} failed={self.failed}{left} in {self.duration:.1f}s"
 
 
 class SyncEngine:
@@ -311,6 +337,68 @@ class SyncEngine:
         log.info("sync batch: %s", rep)
         return rep
 
+    def apply_in_order(self, events: Iterable[ChangeEvent], *, force: bool = False) -> SyncReport:
+        """Apply events one at a time, in exactly the order given, and stop at the first one that fails.
+
+        This is what a sync that continues from a moment in time needs (:class:`CursorChangeSource`): when the
+        changes go oldest first and nothing is sent after a failure, nothing newer than an unsent change is ever
+        stored, so the next run starts before the failed change and not after it. ``report.not_attempted`` counts
+        the events that were left alone.
+        """
+        rep = SyncReport()
+        batch = list(events)
+        for position, ev in enumerate(batch):
+            self.apply(ev, report=rep, force=force)
+            if rep.failed:
+                rep.not_attempted = len(batch) - position - 1
+                break
+        log.info("sync in order: %s", rep)
+        return rep
+
+    # -- bulk sync -----------------------------------------------------------------------
+    def bulk_sync(
+        self,
+        *,
+        customers: Iterable[Any] | None = None,
+        products: Iterable[Any] | None = None,
+        mappings: Iterable[Any] | None = None,
+        max_delete_fraction: float = 0.10,
+        compare: str = "keys",
+        approve_deletions: bool = False,
+        approve_skipped: bool = False,
+    ) -> "BulkSyncReport":
+        """Replace complete data sets in AIOTIC, one call per data set, after checking what that would remove.
+
+        Pass every data set you want replaced as its **complete** content: upsert events (the same ones
+        ``reconcile()`` takes), dicts or bulk row models. Customers go first, then products, then mappings.
+
+        AIOTIC removes whatever a bulk sync does not contain, so before anything is sent the engine compares each
+        data set with what AIOTIC holds and raises :class:`aiotic.sync.BulkSyncRefused` when
+
+        * more than ``max_delete_fraction`` (10 %) of the records AIOTIC holds would be removed, which is what a
+          truncated or filtered export looks like: pass ``approve_deletions=True`` for a clean-up you intend;
+        * a mapping points at a customer or product that AIOTIC will not hold after this run: AIOTIC would skip
+          that row and remove the mapping it holds under the same key. Pass ``approve_skipped=True`` to send anyway;
+          the mappings such rows remove still count as deletions against ``max_delete_fraction``.
+
+        Nothing is sent unless every data set passes. ``compare="count"`` compares only the number of records
+        instead of the keys (one request instead of a listing; it cannot see an export of the right size with the
+        wrong records). With ``dry_run=True`` on the engine the checks run and nothing is sent.
+
+        The engine's state store is not involved: a bulk sync does not read or write fingerprints.
+        """
+        from .bulk import run_bulk_sync
+
+        return run_bulk_sync(
+            self.client,
+            {ChangeKind.CUSTOMER: customers, ChangeKind.PRODUCT: products, ChangeKind.MAPPING: mappings},
+            max_delete_fraction=max_delete_fraction,
+            compare=compare,
+            approve_deletions=approve_deletions,
+            approve_skipped=approve_skipped,
+            dry_run=self.dry_run,
+        )
+
     # -- reconciliation ------------------------------------------------------------------
     def reconcile(
         self,
@@ -356,7 +444,11 @@ class SyncEngine:
         """
         n = 0
         skipped = 0
+        nameless = 0
         for c in self.client.customers.iter_all():
+            if not (c.name or "").strip():  # stored before the API required a name; an upsert cannot write it
+                nameless += 1
+                continue
             ev = ChangeEvent.customer_upsert(c.number, **c.model_dump(include=set(CustomerUpsert.model_fields) - {"id"}, exclude_none=True))
             self.state.set(ev.state_key, ev.fingerprint)
             n += 1
@@ -364,15 +456,17 @@ class SyncEngine:
             if p.description is None:
                 skipped += 1
                 continue
-            ev = ChangeEvent.product_upsert(p.item_number, p.language_code, description=p.description, remark=p.remark)
+            ev = ChangeEvent.product_upsert(p.item_number, p.language_code, description=p.description, remark=p.remark, source_updated_at=p.source_updated_at)
             self.state.set(ev.state_key, ev.fingerprint)
             n += 1
         for cp in self.client.customer_products.iter_all():
-            ev = ChangeEvent.mapping_upsert(cp.customer_number, cp.customer_item_number, item_number=cp.item_number, language_code=cp.language_code)
+            ev = ChangeEvent.mapping_upsert(cp.customer_number, cp.customer_item_number, item_number=cp.item_number, language_code=cp.language_code, source_updated_at=cp.source_updated_at)
             self.state.set(ev.state_key, ev.fingerprint)
             n += 1
         if skipped:
             log.warning("bootstrap: %d product(s) in AIOTIC have no description and were not seeded", skipped)
+        if nameless:
+            log.warning("bootstrap: %d customer(s) in AIOTIC have no name and were not seeded", nameless)
         return n
 
 
@@ -402,6 +496,85 @@ class PollingChangeSource:
                 self.run_once()
             except Exception:  # keep the loop alive; the next run retries
                 log.exception("polling source %s failed", self.name)
+            self._stop.wait(self.interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+class CursorChangeSource:
+    """Incremental sync without local state: the sync continues from the newest ``source_updated_at`` AIOTIC holds.
+
+    ``fetch_changed_since(since)`` returns the changes of **one** data set that your ERP made **at or after**
+    ``since`` (everything when ``since`` is ``None``), **oldest change first**, as upsert events that carry
+    ``source_updated_at`` and, where your ERP reports them, delete events. Typical implementation:
+    ``SELECT ... WHERE updated_at >= ? ORDER BY updated_at``.
+
+    Each run reads the cursor from AIOTIC, steps back by ``margin`` and asks for the changes from there. Three rules
+    keep a change from being lost:
+
+    * changes are sent one at a time, oldest first, and the run **stops at the first one that fails**. Nothing
+      newer than an unsent change is stored, so the cursor cannot move past it;
+    * the start is inclusive and a margin earlier: several records can share one change moment, and "after the
+      cursor" would skip the ones that were not sent yet. Records sent twice are harmless: upserts are idempotent;
+    * every upsert must carry ``source_updated_at``. An upsert without it clears the value in AIOTIC and the
+      cursor would fall back.
+
+    A change that keeps failing (a mapping whose product does not exist, a customer without a name) holds back
+    every later change of that data set until it is fixed in the ERP or left out by ``fetch_changed_since``; each
+    run logs it as an error. Deleted records leave no moment behind in AIOTIC, so a delete is repeated on later runs
+    until a newer upsert moves the cursor; a delete of a record that is already gone counts as done.
+    """
+
+    def __init__(
+        self,
+        kind: ChangeKind | str,
+        fetch_changed_since: Callable[[datetime | None], Iterable[ChangeEvent]],
+        engine: SyncEngine,
+        *,
+        margin: timedelta = timedelta(seconds=1),
+        interval: float = 60.0,
+        language_code: str | None = None,
+    ):
+        self.kind = ChangeKind(kind)
+        self.fetch, self.engine, self.margin, self.interval, self.language_code = fetch_changed_since, engine, margin, interval, language_code
+        self._stop = threading.Event()
+
+    def cursor(self) -> datetime | None:
+        """The newest ``source_updated_at`` AIOTIC holds for this data set (UTC), or ``None`` when there is none."""
+        client = self.engine.client
+        if self.kind == ChangeKind.CUSTOMER:
+            return client.customers.latest_source_update()
+        if self.kind == ChangeKind.PRODUCT:
+            return client.products.latest_source_update(language_code=self.language_code)
+        return client.customer_products.latest_source_update()
+
+    def run_once(self) -> SyncReport:
+        cursor = self.cursor()
+        events = list(self.fetch(cursor - self.margin if cursor else None))
+        previous: datetime | None = None
+        for ev in events:
+            if ev.kind != self.kind:
+                raise ValueError(f"cursor source for {self.kind} was given a {ev.kind} event; use one source per data set")
+            if ev.op != ChangeOp.UPSERT:
+                continue
+            moment = ev.source_updated_at
+            if moment is None:
+                raise ValueError(f"{ev.kind} {ev.key}: an upsert in a cursor sync needs source_updated_at (without it AIOTIC clears the value and the cursor falls back)")
+            if previous is not None and moment < previous:
+                raise ValueError(f"{ev.kind} {ev.key}: changes must come oldest first ({moment.isoformat()} follows {previous.isoformat()})")
+            previous = moment
+        rep = self.engine.apply_in_order(events)
+        if rep.failed:
+            log.error("cursor sync %s stopped at a failed change; %d later change(s) wait for it: %s", self.kind, rep.not_attempted, rep.errors[-1] if rep.errors else "")
+        return rep
+
+    def run_forever(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.run_once()
+            except Exception:  # keep the loop alive; the next run starts from the cursor again
+                log.exception("cursor source %s failed", self.kind)
             self._stop.wait(self.interval)
 
     def stop(self) -> None:

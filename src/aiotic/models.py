@@ -12,7 +12,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 
 class _Model(BaseModel):
@@ -122,8 +122,12 @@ class OrderItem(_Model):
 
 
 class PurchaseOrder(_Model):
+    """The extracted purchase order. ``order_date`` is the date printed on the document; when the document shows
+    none, AIOTIC fills in the date the e-mail was received or else the date of processing (UTC). It is ``None``
+    only in the rare case that this could not be applied."""
+
     order_number: str
-    order_date: str
+    order_date: str | None = None
     delivery_date: str | None = None
     delivery_date_from: str | None = None
     delivery_date_to: str | None = None
@@ -187,6 +191,21 @@ class OrderGroup(_Model):
     message_id: str | None = None
     order_count: int
     orders: list[OrderStatus]
+
+
+class OrderFile(_Model):
+    """One file of an order (``GET /order/{request_id}/files``). ``source`` says what it is. ``raw_email`` and
+    ``email_body`` are the original e-mail and its body: read those with ``orders.email()``. Every other value
+    (``upload``, ``email_attachment`` and values added later) is a file to read by name with
+    ``orders.download_file()``. ``id`` and ``created_at`` are ``None`` for an e-mail part that the tenant's mail
+    intake holds."""
+
+    id: int | None = None
+    filename: str | None = None
+    source: str
+    content_type: str | None = None
+    size_bytes: int | None = None
+    created_at: datetime | None = None
 
 
 class EmailClassification(_Model):
@@ -274,19 +293,28 @@ class ErpReceiveRequest(_Model):
 
 
 class ErpReceiveResponse(_Model):
-    """Body your receive endpoint must return. ``success`` is authoritative."""
+    """Body your receive endpoint must return. A boolean ``success`` is authoritative at any HTTP status.
+
+    ``retryable`` belongs to a refusal only: ``True`` tells AIOTIC that the refusal is temporary and that sending
+    the same order again cannot create it twice. AIOTIC then sends it again (2 more times by default, a few
+    seconds apart, with the same ``request_id``) before the send counts as refused.
+    """
 
     success: bool
     order_number: str | None = None
     error: str | None = None
+    retryable: bool | None = None
 
     @classmethod
     def accepted(cls, order_number: str) -> "ErpReceiveResponse":
         return cls(success=True, order_number=order_number)
 
     @classmethod
-    def rejected(cls, error: str) -> "ErpReceiveResponse":
-        return cls(success=False, error=error)
+    def rejected(cls, error: str, *, retryable: bool = False) -> "ErpReceiveResponse":
+        """A refusal. Pass ``retryable=True`` only for a temporary reason (a record that is in use for a moment, a
+        deadlock) **and** only when a repeat is safe: the refused attempt created nothing, or your ERP rejects a
+        second order with the same ``request_id``."""
+        return cls(success=False, error=error, retryable=True if retryable else None)
 
 
 class ErpSendResponse(_Model):
@@ -346,6 +374,36 @@ class ReprocessResponse(_Model):
 
 
 class CustomerUpsert(_Model):
+    """What you send when creating or updating a customer. ``name`` is required and may not be blank: the API
+    refuses a customer without one. ``source_updated_at`` is when your ERP last changed the record; it needs a
+    zone or offset, and a write without it clears the value AIOTIC held."""
+
+    id: UUID | None = None
+    name: str
+    postal_code: str | None = None
+    city: str | None = None
+    address: str | None = None
+    contact_person: str | None = None
+    phone_number: str | None = None
+    vat_number: str | None = None
+    email: str | None = None
+    coc_number: str | None = None
+    home_page: str | None = None
+    source_updated_at: AwareDatetime | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _name_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a customer needs a name: it may not be empty or only spaces")
+        return value
+
+
+class Customer(_Model):
+    """A customer as AIOTIC returns it. ``name`` can be absent on records stored before the API required one;
+    writing a customer (:class:`CustomerUpsert`) requires it. ``source_updated_at`` is in UTC."""
+
+    number: str
     id: UUID | None = None
     name: str | None = None
     postal_code: str | None = None
@@ -357,13 +415,10 @@ class CustomerUpsert(_Model):
     email: str | None = None
     coc_number: str | None = None
     home_page: str | None = None
-
-
-class Customer(CustomerUpsert):
-    number: str
     similarity: float | None = None
     archived_at: datetime | None = None
     superseded_by: str | None = None
+    source_updated_at: datetime | None = None
 
 
 class CustomerListResponse(_Model):
@@ -382,6 +437,7 @@ class CustomerSearchResponse(_Model):
 class ProductUpsert(_Model):
     description: str
     remark: str | None = None
+    source_updated_at: AwareDatetime | None = None
 
 
 class Product(_Model):
@@ -393,6 +449,7 @@ class Product(_Model):
     description: str | None = None
     remark: str | None = None
     created_at: datetime | None = None
+    source_updated_at: datetime | None = None
 
 
 class ProductListResponse(_Model):
@@ -405,12 +462,16 @@ class ProductListResponse(_Model):
 class CustomerProductUpsert(_Model):
     item_number: str
     language_code: str
+    source_updated_at: AwareDatetime | None = None
 
 
-class CustomerProduct(CustomerProductUpsert):
+class CustomerProduct(_Model):
     customer_number: str
     customer_item_number: str
+    item_number: str
+    language_code: str
     created_at: datetime | None = None
+    source_updated_at: datetime | None = None
 
 
 class CustomerProductListResponse(_Model):
@@ -418,6 +479,75 @@ class CustomerProductListResponse(_Model):
     total: int
     limit: int
     offset: int
+
+
+# --------------------------------------------------------------------------------------------
+# Bulk sync: one call carries a data set's complete content and replaces what AIOTIC holds
+# --------------------------------------------------------------------------------------------
+
+
+class CustomerBulkRow(CustomerUpsert):
+    """One customer in ``customers.bulk_sync()``: the number plus the fields of an upsert."""
+
+    number: str = Field(min_length=1)
+
+
+class ProductBulkRow(ProductUpsert):
+    """One product record in ``products.bulk_sync()``. Send every language you sell in: a bulk sync replaces the
+    products of all languages."""
+
+    item_number: str = Field(min_length=1)
+    language_code: str = Field(min_length=1)
+    created_at: datetime | None = None
+
+
+class CustomerProductBulkRow(CustomerProductUpsert):
+    """One customer item mapping in ``customer_products.bulk_sync()``."""
+
+    customer_number: str = Field(min_length=1)
+    customer_item_number: str = Field(min_length=1)
+    created_at: datetime | None = None
+
+
+class BulkResult(_Model):
+    """What a bulk sync did. Every row sent is counted once in ``inserted``, ``updated``, ``unchanged`` or (for
+    mappings) ``skipped_total``; ``deleted`` counts what AIOTIC held and the call removed.
+
+    ``attempts`` is set by the SDK, not by the API: how often the request was sent. Above 1 the counts are those
+    of the last attempt; an earlier attempt that ended without an answer may already have applied the changes,
+    which then show up here as ``unchanged``.
+    """
+
+    received: int
+    inserted: int
+    updated: int
+    unchanged: int
+    deleted: int
+    attempts: int = 1
+
+
+class CustomerBulkResult(BulkResult):
+    mappings_deleted: int = 0
+
+
+class ProductBulkResult(BulkResult):
+    mappings_deleted: int = 0
+
+
+class SkippedMapping(_Model):
+    """A mapping in a bulk sync that was not stored. ``reason`` is ``customer_missing`` or ``product_missing``."""
+
+    customer_number: str
+    customer_item_number: str
+    reason: str
+
+
+class CustomerProductBulkResult(BulkResult):
+    """``skipped`` lists the first 1000 rows that were not stored because AIOTIC holds no such customer or product.
+    A mapping AIOTIC held under a skipped row's key is removed and counted in ``deleted``."""
+
+    skipped_total: int = 0
+    skipped: list[SkippedMapping] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------------------------

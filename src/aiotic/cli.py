@@ -26,6 +26,8 @@ except ImportError:  # pragma: no cover
     print("The CLI needs the 'cli' extra: pip install 'aiotic-sdk[cli]'", file=sys.stderr)
     raise SystemExit(2)
 
+from pydantic import ValidationError
+
 from . import __version__
 from .client import AioticClient
 from .config import Settings
@@ -192,7 +194,7 @@ def orders_watch(interval: float = 15.0, state: str = "aiotic-watch-state.db") -
 
 
 REQUIRED_COLUMNS: dict[str, tuple[set[str], ...]] = {
-    "customers": ({"number"}, {"customer_number"}),
+    "customers": ({"number", "name"}, {"customer_number", "name"}),
     "products": ({"item_number", "description"},),
     "mappings": ({"customer_number", "customer_item_number", "item_number"},),
 }
@@ -255,8 +257,22 @@ def _read_rows(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
         return rows, columns
 
 
-def _check_columns(kind: str, columns: list[str], source: Path) -> None:
-    options = REQUIRED_COLUMNS[kind]
+# A bulk sync replaces the data set, so nothing about a record's key is filled in for the file: the language too
+# must be in it.
+BULK_REQUIRED_COLUMNS: dict[str, tuple[set[str], ...]] = {
+    "customers": REQUIRED_COLUMNS["customers"],
+    "products": ({"item_number", "language_code", "description"},),
+    "mappings": ({"customer_number", "customer_item_number", "item_number", "language_code"},),
+}
+KEY_COLUMNS = {
+    "customers": ("number",),
+    "products": ("item_number", "language_code"),
+    "mappings": ("customer_number", "customer_item_number", "item_number", "language_code"),
+}
+
+
+def _check_columns(kind: str, columns: list[str], source: Path, required: dict[str, tuple[set[str], ...]] = REQUIRED_COLUMNS) -> None:
+    options = required[kind]
     if not any(req <= set(columns) for req in options):
         wanted = " or ".join(", ".join(sorted(o)) for o in options)
         raise typer.BadParameter(f"{source}: a {kind} file needs the column(s) {wanted}; found: {', '.join(columns) or 'none'}")
@@ -268,19 +284,70 @@ def _load(kind: str, source: Path) -> list[Any]:
     return _events(kind, rows)
 
 
+def _blank(value: Any) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _found(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true/false"
+    return {int: "a number", float: "a number", list: "a list", dict: "an object"}.get(type(value), type(value).__name__)
+
+
+def _key(record: dict[str, Any], column: str, kind: str, position: int, *, text_only: bool = False) -> str:
+    """A value that identifies a record. A blank one is an error, and so is one that is not text: neither may be
+    sent as some other text. A whole number has one way to write it and is accepted, except in a bulk sync
+    (``text_only``), where a file is sent as it is."""
+    value = record.get(column)
+    if _blank(value):
+        raise typer.BadParameter(f"{kind} record {position}: {column} is blank")
+    if isinstance(value, str):
+        return value
+    if text_only or isinstance(value, bool) or not isinstance(value, int):
+        raise typer.BadParameter(f'{kind} record {position}: {column} must be text (in a JSON file: "…" in quotes), found {_found(value)}')
+    return str(value)
+
+
+def _bulk_rows(kind: str, source: Path) -> list[dict[str, Any]]:
+    """The records of a file as bulk sync rows: every column the API knows, as it is in the file. Nothing is
+    filled in, and a record without one of its key values stops the run."""
+    from . import models as m
+
+    model = {"customers": m.CustomerBulkRow, "products": m.ProductBulkRow, "mappings": m.CustomerProductBulkRow}[kind]
+    rows, columns = _read_rows(source)
+    _check_columns(kind, columns, source, BULK_REQUIRED_COLUMNS)
+    out = []
+    for position, record in enumerate(rows, start=1):
+        if kind == "customers" and _blank(record.get("number")):
+            record = {**record, "number": record.get("customer_number")}
+        row = {column: value for column, value in record.items() if column in model.model_fields and not _blank(value)}
+        for column in KEY_COLUMNS[kind]:
+            row[column] = _key(record, column, kind, position, text_only=True)
+        out.append(row)
+    return out
+
+
 def _events(kind: str, rows: list[dict[str, Any]]) -> list[Any]:
     from .sync import ChangeEvent
 
     out = []
-    for r in rows:
+    for position, r in enumerate(rows, start=1):
         r = {k: (v if v != "" else None) for k, v in r.items()}
-        if kind == "customers":
-            number = r.pop("number", None) or r.pop("customer_number")
-            out.append(ChangeEvent.customer_upsert(str(number), **{k: v for k, v in r.items() if k in {"name", "postal_code", "city", "address", "contact_person", "phone_number", "vat_number", "email", "coc_number", "home_page"}}))
-        elif kind == "products":
-            out.append(ChangeEvent.product_upsert(str(r["item_number"]), str(r.get("language_code") or "nl"), description=r.get("description") or "", remark=r.get("remark")))
-        else:
-            out.append(ChangeEvent.mapping_upsert(str(r["customer_number"]), str(r["customer_item_number"]), item_number=str(r["item_number"]), language_code=str(r.get("language_code") or "nl")))
+        for column in ("item_number",) if kind == "products" else ("customer_number", "customer_item_number", "item_number") if kind == "mappings" else ():
+            _key(r, column, kind, position)
+        if kind != "customers" and not _blank(r.get("language_code")):
+            _key(r, "language_code", kind, position)
+        try:
+            if kind == "customers":
+                number = _key(r, "number" if not _blank(r.get("number")) or "customer_number" not in r else "customer_number", kind, position)
+                out.append(ChangeEvent.customer_upsert(number, **{k: v for k, v in r.items() if k in {"name", "postal_code", "city", "address", "contact_person", "phone_number", "vat_number", "email", "coc_number", "home_page", "source_updated_at"}}))
+            elif kind == "products":
+                out.append(ChangeEvent.product_upsert(str(r["item_number"]), str(r.get("language_code") or "nl"), description=r.get("description") or "", remark=r.get("remark"), source_updated_at=r.get("source_updated_at")))
+            else:
+                out.append(ChangeEvent.mapping_upsert(str(r["customer_number"]), str(r["customer_item_number"]), item_number=str(r["item_number"]), language_code=str(r.get("language_code") or "nl"), source_updated_at=r.get("source_updated_at")))
+        except ValidationError as exc:
+            first = exc.errors()[0]
+            raise typer.BadParameter(f"{kind} record {position}: {'.'.join(str(p) for p in first['loc'])}: {first['msg']}")
     return out
 
 
@@ -334,6 +401,51 @@ def sync_reconcile(
     for e in rep.errors[:20]:
         rprint(f"  [red]{e}[/red]")
     raise typer.Exit(1 if rep.failed else 0)
+
+
+@sync_app.command("bulk")
+def sync_bulk(
+    customers: Path | None = None,
+    products: Path | None = None,
+    mappings: Path | None = None,
+    max_delete_fraction: float = typer.Option(0.10, help="Refuse when a data set would remove more than this share of what AIOTIC holds"),
+    compare: str = typer.Option("keys", help="'keys' compares every record with AIOTIC; 'count' only the totals"),
+    approve_deletions: bool = typer.Option(False, "--approve-deletions", help="The files are complete and the records missing from them must go"),
+    approve_skipped: bool = typer.Option(False, "--approve-skipped", help="Send mappings even when some point at an unknown customer or product. The mappings held under their keys are removed and count as deletions"),
+    dry_run: bool = False,
+) -> None:
+    """Replace complete data sets, one call each: AIOTIC removes every record a file does not contain.
+
+    Each file must hold the complete data set (products: every language) and name every record in full: a
+    products or mappings file needs the language_code column, and a key value that is blank or not text stops the
+    run. Before
+    anything is sent, the files are compared with what AIOTIC holds; a file that would remove more than
+    --max-delete-fraction of it, or mappings that point at an unknown customer or product, stop the run with
+    exit code 2 and nothing is changed.
+    """
+    from .sync import BulkSyncRefused, SyncEngine
+
+    sources = {
+        "customers": _bulk_rows("customers", customers) if customers else None,
+        "products": _bulk_rows("products", products) if products else None,
+        "mappings": _bulk_rows("mappings", mappings) if mappings else None,
+    }
+    if not any(v is not None for v in sources.values()):
+        raise typer.BadParameter("give at least one of --customers, --products, --mappings")
+    engine = SyncEngine(_client(), dry_run=dry_run)
+    try:
+        rep = engine.bulk_sync(**sources, max_delete_fraction=max_delete_fraction, compare=compare, approve_deletions=approve_deletions, approve_skipped=approve_skipped)
+    except BulkSyncRefused as exc:
+        rprint(f"[red]{exc}[/red]")
+        rprint("Nothing was sent. Fix the export, or repeat with --approve-deletions / --approve-skipped when this is what you intend.")
+        raise typer.Exit(2)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc))
+    rprint(f"bulk: {rep}")
+    for kind, result in rep.results.items():
+        for s in getattr(result, "skipped", [])[:20]:
+            rprint(f"  [red]skipped {s.customer_number} / {s.customer_item_number}: {s.reason}[/red]")
+    raise typer.Exit(0 if rep.ok else 1)
 
 
 @sync_app.command("bootstrap-state")

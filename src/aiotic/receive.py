@@ -5,8 +5,11 @@ Contract (see the guide → *Receiving orders*):
 * ``POST <your URL>`` with ``X-API-KEY: <key you gave AIOTIC>`` and a JSON body
   ``{"request_id": "...", "purchase_order": {...}}``.
 * Reply with JSON ``{"success": true, "order_number": "..."}`` or ``{"success": false, "error": "..."}``.
-  The body is authoritative; the HTTP status is not.
-* ``request_id`` is stable across retries → be idempotent.
+  A boolean ``success`` is authoritative at any HTTP status. Without one, AIOTIC accepts only a 2xx answer;
+  a body that is not JSON is a failed send at any status.
+* ``{"success": false, "error": "...", "retryable": true}`` makes AIOTIC send the same order again, 2 more
+  times by default. Only say so when a repeat cannot create the order twice.
+* ``request_id`` is the same on every send of an order → be idempotent.
 
 :class:`ErpReceiver` implements all of that framework-independently; :func:`create_receive_router`
 wraps it for FastAPI. Wire it into Flask/Django/anything by calling ``receiver.handle(...)``.
@@ -201,7 +204,7 @@ class ErpReceiver:
         try:
             result = self.erp.create_sales_order(rid, order)
         except ErpRejected as exc:
-            resp = ErpReceiveResponse.rejected(str(exc))
+            resp = ErpReceiveResponse.rejected(str(exc), retryable=getattr(exc, "retryable", False))
             if self.on_rejected:
                 self.on_rejected(req, resp, verdict)
             return ReceiveOutcome(resp, verdict, None)

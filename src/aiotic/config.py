@@ -7,6 +7,7 @@ Environment variables (all prefixed ``AIOTIC_``):
 ``AIOTIC_API_KEY``      Integration key (orders, ERP send, rejected e-mails, …)
 ``AIOTIC_SYNC_API_KEY`` Optional sync key for ``/customer``, ``/product``, ``/customer-product``
 ``AIOTIC_TIMEOUT``      HTTP timeout in seconds (default 30)
+``AIOTIC_BULK_TIMEOUT`` HTTP timeout in seconds for a bulk sync (default 120)
 ``AIOTIC_MAX_RETRIES``  Retries for transient failures (default 3)
 ``AIOTIC_RATE_LIMIT``   Max requests per second the client will issue (default 10; 0 = unlimited)
 ``AIOTIC_ERP_RECEIVE_KEY``  The key AIOTIC sends in ``X-API-KEY`` to *your* receive endpoint
@@ -46,6 +47,7 @@ class Settings:
     api_key: str = ""
     sync_api_key: str | None = None
     timeout: float = 30.0
+    bulk_timeout: float = 120.0
     max_retries: int = 3
     rate_limit: float = 10.0
     erp_receive_key: str | None = None
@@ -69,6 +71,7 @@ class Settings:
             api_key=get("API_KEY", "") or "",
             sync_api_key=get("SYNC_API_KEY") or None,
             timeout=float(get("TIMEOUT", "30") or 30),
+            bulk_timeout=float(get("BULK_TIMEOUT", "120") or 120),
             max_retries=int(get("MAX_RETRIES", "3") or 3),
             rate_limit=float(get("RATE_LIMIT", "10") or 10),
             erp_receive_key=get("ERP_RECEIVE_KEY") or None,

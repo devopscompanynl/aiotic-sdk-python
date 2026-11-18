@@ -32,7 +32,7 @@ SAMPLE = {
     "shipping_details": {"recipient": {"company": None, "department": None, "contact_person": None, "email": None, "phone": None, "address": {"street": None, "postal_code": None, "city": None, "country": None}}, "special_instructions": None},
     "items": [
         {"article_number": "PROD-001", "description": "LED Driver", "quantity": 10, "unit": "stuks", "price": 12.34, "currency": None, "line_total": 123.4},
-        {"article_number": "620206_01", "description": "Cable", "quantity": 2, "unit": "rol", "price": 45.0, "currency": None, "line_total": 90.0},
+        {"article_number": "CBL-3015", "description": "Cable", "quantity": 2, "unit": "rol", "price": 45.0, "currency": None, "line_total": 90.0},
     ],
 }
 
@@ -57,7 +57,7 @@ def test_validators_reject_unknown_article_and_blocked_customer() -> None:
     v = p.run(ErpPurchaseOrder.model_validate(SAMPLE))
     codes = {i.code for i in v.errors}
     assert codes == {"unknown_article", "customer_blocked"}
-    assert "620206_01" in v.error_message()
+    assert "CBL-3015" in v.error_message()
 
 
 def test_data_api_adapter_with_pipeline() -> None:
@@ -84,7 +84,7 @@ def test_data_api_adapter_with_pipeline() -> None:
 def test_blocked_customer_in_data_api() -> None:
     erp = DataApiAdapter(sqlite_demo())
     receiver = ErpReceiver(erp, api_key="k", pipeline=default_pipeline(erp, InMemoryStore()))
-    sample = {**SAMPLE, "customer": {**SAMPLE["customer"], "customer_id": "10577"}}
+    sample = {**SAMPLE, "customer": {**SAMPLE["customer"], "customer_id": "40112"}}
     out = receiver.handle({"request_id": str(uuid.uuid4()), "purchase_order": sample}, api_key_header="k")
     assert not out.response.success and "blocked" in out.response.error
 
@@ -127,6 +127,6 @@ def test_end_to_end_send(client: AioticClient, http: httpx.Client) -> None:
 
 def test_receive_request_model_roundtrip() -> None:
     req = ErpReceiveRequest.model_validate({"request_id": str(uuid.uuid4()), "purchase_order": SAMPLE})
-    assert req.purchase_order.items[1].article_number == "620206_01"
+    assert req.purchase_order.items[1].article_number == "CBL-3015"
     v = Pipeline(validators=[V.LineTotalsConsistent(severity=Severity.ERROR)]).run(req.purchase_order)
     assert v.ok

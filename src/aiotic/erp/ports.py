@@ -22,7 +22,28 @@ class ErpRejected(Exception):
 
     The message is returned to AIOTIC as ``{"success": false, "error": <message>}`` and shown to
     the operator. Use it for "unknown item", "customer blocked", "credit limit" — not for outages.
+
+    ``retryable=True`` adds ``"retryable": true`` to the answer, which makes AIOTIC send the same order
+    again (2 more times by default, a few seconds apart). Use :class:`ErpTemporaryRefusal` for that.
     """
+
+    def __init__(self, message: str = "", *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class ErpTemporaryRefusal(ErpRejected):
+    """Raise from an adapter when the ERP refuses the order for a reason that passes by itself: a record that
+    is in use for a moment, a deadlock, a number series that is busy.
+
+    AIOTIC then sends the same order again with the same ``request_id``. Raise it **only** when a repeat cannot
+    create the order twice: the refused attempt created nothing, or the ERP rejects a second order with the same
+    external reference (see :class:`ErpPort`). An outage, a timeout or an error you cannot classify is not a
+    temporary refusal: let that exception propagate, and the operator sends the order again.
+    """
+
+    def __init__(self, message: str = ""):
+        super().__init__(message, retryable=True)
 
 
 @runtime_checkable
@@ -41,7 +62,8 @@ class CustomerPort(Protocol):
 class ErpPort(Protocol):
     """The single write operation the receive endpoint needs, and the idempotency contract that comes with it.
 
-    AIOTIC retries sends, and several instances of your service may receive the same delivery. One receiver
+    AIOTIC sends an order again with the same ``request_id`` (after a refusal marked retryable, and when an
+    operator sends again after a failed send), and several instances of your service may receive the same delivery. One receiver
     instance serialises deliveries with the same ``request_id`` and remembers results, but it cannot do that
     across instances or after a lost response. Therefore ``create_sales_order`` **must be safe to call
     twice with the same ``request_id``**: store the id as a unique external reference in the ERP (a unique index,

@@ -70,11 +70,18 @@ def test_other_non_idempotent_posts_surface_a_503_while_keyed_uploads_and_gets_r
             with pytest.raises(AioticUnavailableError):
                 call(c)
         assert len(accepted) == 1
-    accepted, transport = _accepts_then_503()  # a document upload carries its request_id: the replay is the same order
-    with patch("aiotic.client.time.sleep", lambda _: None), _client(transport) as c:
-        c.orders.upload([("po.pdf", b"fixture")])
-    ids = [re.search(rb'name="request_id"\r\n\r\n([^\r]+)', b).group(1) for b in accepted]  # type: ignore[union-attr]
-    assert len(accepted) == 2 and ids[0] == ids[1]
+    posts: list[bytes] = []
+
+    def upload_503_then_visible(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            posts.append(request.read())
+            return httpx.Response(503, json={"detail": "upstream connection reset after the request was accepted"})
+        return httpx.Response(200, json={"request_id": request.url.path.rsplit("/", 1)[1], "status": "QUEUED", "timestamp": "2026-11-18T10:00:00"})
+
+    # A document upload is not replayed either: the client looks its request_id up and finds the order.
+    with patch("aiotic.client.time.sleep", lambda _: None), _client(httpx.MockTransport(upload_503_then_visible)) as c:
+        up = c.orders.upload([("po.pdf", b"fixture")])
+    assert len(posts) == 1 and str(up.request_id).encode() == re.search(rb'name="request_id"\r\n\r\n([^\r]+)', posts[0]).group(1)  # type: ignore[union-attr]
     seen: list[httpx.Request] = []
 
     def get_503_then_ok(request: httpx.Request) -> httpx.Response:

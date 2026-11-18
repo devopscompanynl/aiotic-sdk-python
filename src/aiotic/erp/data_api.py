@@ -136,8 +136,8 @@ def sqlite_demo(path: str = ":memory:", *, seed: bool = True) -> Callable[[], sq
     keep_alive = connect()  # keeps a shared in-memory DB alive
     keep_alive.executescript(SCHEMA)
     if seed:
-        keep_alive.executemany("INSERT OR IGNORE INTO items VALUES (?, ?, 0)", [("PROD-001", "LED Driver 48V"), ("PROD-002", "LED Panel 60x60"), ("620206_01", "Cable 3x1.5")])
-        keep_alive.executemany("INSERT OR IGNORE INTO customers VALUES (?, ?, ?, ?)", [("58931", "LUMITECH INSTALLATIES", 0, 10000.0), ("10577", "Example Handel GmbH", 1, 0.0)])
+        keep_alive.executemany("INSERT OR IGNORE INTO items VALUES (?, ?, 0)", [("PROD-001", "LED Driver 48V"), ("PROD-002", "LED Panel 60x60"), ("CBL-3015", "Cable 3x1.5")])
+        keep_alive.executemany("INSERT OR IGNORE INTO customers VALUES (?, ?, ?, ?)", [("58931", "LUMITECH INSTALLATIES", 0, 10000.0), ("40112", "Example Handel GmbH", 1, 0.0)])
         keep_alive.commit()
     connect.keep_alive = keep_alive  # type: ignore[attr-defined]
     return connect

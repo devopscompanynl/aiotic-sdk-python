@@ -12,7 +12,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from aiotic import AioticClient, AioticIdentifierError, AioticServerError, AioticTransportError, AioticUnavailableError, AsyncAioticClient
+from aiotic import AioticClient, AioticIdentifierError, AioticOutcomeUnknownError, AioticServerError, AioticTransportError, AioticUnavailableError, AsyncAioticClient
 from aiotic.config import Settings
 from aiotic.models import Product, ProductListResponse, ProductUpsert
 from aiotic.sync import InMemoryStateStore, SyncEngine
@@ -98,7 +98,7 @@ def test_identifiers_are_encoded_in_every_path(raw: str, encoded: str) -> None:
     assert paths[6].startswith(f"/customer/search/{encoded}?") and paths[7].endswith(f"/{encoded}")
 
 
-@pytest.mark.parametrize("bad", ["", ".", "..", "C/1", "C\\1", "C\n1", "C\x7f"])
+@pytest.mark.parametrize("bad", ["", ".", "..", "C\\1", "C\n1", "C\x7f", "/C", "C/", "C//1", "C/../1"])
 def test_unsafe_identifiers_are_refused_before_any_request(bad: str) -> None:
     seen, transport = _recorder(ANY_RECORD)
     with _client(transport) as c:
@@ -112,6 +112,31 @@ def test_unsafe_identifiers_are_refused_before_any_request(bad: str) -> None:
             with pytest.raises(AioticIdentifierError):
                 call()
     assert seen == []
+
+
+def test_a_slash_travels_only_in_item_numbers_and_customer_item_numbers() -> None:
+    seen, transport = _recorder(ANY_RECORD)
+    with _client(transport) as c:
+        c.products.upsert("LED 48/100 W", "nl", {"description": "x"})
+        c.products.get("CBL-3015/01", "nl")
+        c.products.delete("CBL-3015/01", "nl")
+        c.customer_products.get("C1", "LT/ART/001")
+        c.customer_products.delete("C1", "LT/ART/001")
+        for refused in (
+            lambda: c.customers.get("C/1"),  # a customer number is one path segment in the API
+            lambda: c.products.get("P1", "n/l"),
+            lambda: c.customer_products.get("C/1", "X"),
+            lambda: c.orders.download_file(uuid.uuid4(), "dir/file.pdf"),
+        ):
+            with pytest.raises(AioticIdentifierError):
+                refused()
+    assert [r.url.raw_path.decode() for r in seen] == [
+        "/product/LED%2048%2F100%20W/nl",
+        "/product/CBL-3015%2F01/nl",
+        "/product/CBL-3015%2F01/nl",
+        "/customer-product/C1/LT%2FART%2F001",
+        "/customer-product/C1/LT%2FART%2F001",
+    ]
 
 
 def test_async_client_encodes_and_refuses_identifiers() -> None:
@@ -155,24 +180,69 @@ def _request_ids(bodies: list[bytes]) -> list[bytes]:
     return [re.search(rb'name="request_id"\r\n\r\n([^\r]+)', b).group(1) for b in bodies]  # type: ignore[union-attr]
 
 
-def test_upload_replay_carries_the_same_generated_request_id() -> None:
-    bodies, transport = _lost_then_ok()
+def _upload_lost(*, appears_after: int | None):
+    """An upload whose first answer is lost. The order is visible from the ``appears_after``-th lookup on
+    (never when ``None``); a second upload is answered normally."""
+    uploads: list[bytes] = []
+    lookups: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            uploads.append(request.read())
+            if len(uploads) == 1:
+                raise httpx.ReadTimeout("response lost after the server accepted the request", request=request)
+            return httpx.Response(200, json={"request_id": _request_ids(uploads)[0].decode(), "split": False})
+        lookups.append(request.url.path)
+        if appears_after is not None and len(lookups) >= appears_after:
+            return httpx.Response(200, json={"request_id": request.url.path.rsplit("/", 1)[1], "status": "QUEUED", "timestamp": "2026-11-18T10:00:00"})
+        return httpx.Response(404, json={"detail": "not found"})
+
+    return uploads, lookups, httpx.MockTransport(handler)
+
+
+def test_an_upload_whose_answer_was_lost_is_looked_up_and_not_sent_again() -> None:
+    # The first lookup still answers 404: the request can be on its way. The order shows up on the third.
+    uploads, lookups, transport = _upload_lost(appears_after=3)
     with patch("aiotic.client.time.sleep", lambda _: None), _client(transport) as c:
-        c.orders.upload([("po.pdf", b"fixture")])
-    assert len(bodies) == 2
-    ids = _request_ids(bodies)
-    assert ids[0] == ids[1] and uuid.UUID(ids[0].decode()).version == 4  # the server sees one logical upload
+        up = c.orders.upload([("po.pdf", b"fixture")], confirm_timeout=60)
+    assert len(uploads) == 1 and len(lookups) == 3
+    assert str(up.request_id).encode() == _request_ids(uploads)[0] and uuid.UUID(str(up.request_id)).version == 4
 
 
-def test_upload_keeps_the_callers_request_id_and_replays_file_objects_completely(tmp_path) -> None:
-    import io
-
-    bodies, transport = _lost_then_ok()
+def test_an_upload_that_never_shows_up_is_reported_with_its_request_id_and_not_repeated() -> None:
+    uploads, lookups, transport = _upload_lost(appears_after=None)
     rid = uuid.uuid4()
     with patch("aiotic.client.time.sleep", lambda _: None), _client(transport) as c:
-        c.orders.upload([("po.pdf", io.BytesIO(b"%PDF fixture body"))], request_id=rid)
-    assert _request_ids(bodies) == [str(rid).encode()] * 2
-    assert all(b"%PDF fixture body" in b for b in bodies)  # the second attempt is not an empty body
+        with pytest.raises(AioticOutcomeUnknownError) as caught:
+            c.orders.upload([("po.pdf", b"fixture")], request_id=rid, confirm_timeout=0)
+    assert len(uploads) == 1 and len(lookups) >= 1  # looked up, never uploaded twice
+    assert caught.value.request_id == str(rid) and "look it up" in str(caught.value)
+
+
+def test_resend_if_missing_uploads_once_more_with_the_same_id_and_the_complete_body() -> None:
+    import io
+
+    uploads, lookups, transport = _upload_lost(appears_after=None)
+    rid = uuid.uuid4()
+    with patch("aiotic.client.time.sleep", lambda _: None), _client(transport) as c:
+        up = c.orders.upload([("po.pdf", io.BytesIO(b"%PDF fixture body"))], request_id=rid, confirm_timeout=0, resend_if_missing=True)
+    assert up.request_id == rid and lookups  # the lookup came first
+    assert _request_ids(uploads) == [str(rid).encode()] * 2
+    assert all(b"%PDF fixture body" in b for b in uploads)  # the second attempt is not an empty body
+
+
+def test_an_upload_that_provably_did_not_arrive_is_simply_sent_again() -> None:
+    uploads: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        uploads.append(request.read())
+        if len(uploads) == 1:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, json={"request_id": _request_ids(uploads)[0].decode(), "split": False})
+
+    with patch("aiotic.client.time.sleep", lambda _: None), _client(httpx.MockTransport(handler)) as c:
+        c.orders.upload([("po.pdf", b"fixture")])
+    assert len(uploads) == 2 and len(set(_request_ids(uploads))) == 1
 
 
 def test_raw_upload_is_never_replayed_after_a_lost_response() -> None:
@@ -216,24 +286,26 @@ def test_http_retry_policy_is_operation_aware(call, status: int, expected_attemp
 
 
 def test_async_upload_replay_and_raw_upload_policy() -> None:
-    async def run() -> tuple[list[bytes], int]:
-        bodies, transport = _lost_then_ok()
+    async def run() -> tuple[list[bytes], list[str], int]:
+        uploads, lookups, transport = _upload_lost(appears_after=None)
 
         async def no_delay(_: float) -> None:
             return None
 
         with patch("aiotic.aio.asyncio.sleep", no_delay):
             async with AsyncAioticClient(base_url="https://example.invalid", api_key="test-only", rate_limit=0, max_retries=2, transport=transport) as c:
-                await c.orders.upload([("po.pdf", b"fixture")])
+                with pytest.raises(AioticOutcomeUnknownError):
+                    await c.orders.upload([("po.pdf", b"fixture")], confirm_timeout=0)
+                assert len(uploads) == 1  # looked up, not sent again
+                await c.orders.upload([("po.pdf", b"fixture")], confirm_timeout=0, resend_if_missing=True)
             raw_bodies, raw_transport = _lost_then_ok()
             async with AsyncAioticClient(base_url="https://example.invalid", api_key="test-only", rate_limit=0, max_retries=2, transport=raw_transport) as c:
                 with pytest.raises(AioticTransportError):
                     await c.orders.upload_raw_email(("m.eml", b"Subject: x"))
-        return bodies, len(raw_bodies)
+        return uploads, lookups, len(raw_bodies)
 
-    bodies, raw_attempts = asyncio.run(run())
-    ids = _request_ids(bodies)
-    assert len(bodies) == 2 and ids[0] == ids[1] and raw_attempts == 1
+    uploads, lookups, raw_attempts = asyncio.run(run())
+    assert len(uploads) == 2 and lookups and raw_attempts == 1
 
 
 # ---- 8. a product without a description is a valid response, never a valid write --------------------------------
@@ -280,3 +352,37 @@ def test_null_descriptions_parse_in_both_clients_and_bootstrap_skips_them() -> N
             return (await c.products.get("P1", "nl")).description
 
     assert asyncio.run(run()) is None
+
+
+# ---- answers of a gateway: no JSON, and a 503 that does not say why ------------------------------------------------
+
+
+def _gateway(status: int):
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(status, text=f"<html><body><h1>{status}</h1></body></html>", headers={"content-type": "text/html"})
+
+    return seen, httpx.MockTransport(handler)
+
+
+def test_a_too_large_upload_refused_by_a_gateway_is_a_validation_error_without_json() -> None:
+    from aiotic import AioticValidationError
+
+    seen, transport = _gateway(413)
+    with _client(transport) as c, pytest.raises(AioticValidationError) as refused:
+        c.orders.upload([("a.pdf", b"%PDF-1.4"), ("b.pdf", b"%PDF-1.4")], request_id=uuid.uuid4())
+    assert refused.value.status == 413 and isinstance(refused.value.detail, str) and len(seen) == 1  # not sent again
+
+
+def test_a_503_without_json_is_backed_off_on_a_read_and_surfaced_on_an_erp_send() -> None:
+    seen, transport = _gateway(503)
+    with patch("aiotic.client.time.sleep", lambda _: None), _client(transport) as c:
+        with pytest.raises(AioticUnavailableError) as read:
+            c.customers.list()
+        attempts_of_the_read = len(seen)
+        with pytest.raises(AioticUnavailableError):
+            c.erp.send(uuid.uuid4())
+    assert attempts_of_the_read == 3 and read.value.status == 503  # a read is safe to repeat: two more attempts
+    assert len(seen) == attempts_of_the_read + 1  # the send is not repeated: a 503 does not say what happened
